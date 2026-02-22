@@ -162,6 +162,105 @@ def channel_from_mode(image_bgr: np.ndarray, mode: str) -> np.ndarray:
     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
 
+def fuse_line_segments(raw_lines: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
+    if raw_lines is None or len(raw_lines) == 0:
+        return np.empty((0, 1, 4), dtype=np.float32)
+
+    h, w = image_shape
+    min_dim = float(min(h, w))
+    endpoint_thresh = float(np.clip(0.030 * min_dim, 3.0, 18.0))
+    angle_thresh = 8.0
+    collinear_thresh = float(np.clip(0.020 * min_dim, 2.0, 10.0))
+    min_seg_len = 2.0
+
+    segments: List[tuple[np.ndarray, np.ndarray]] = []
+    for seg in raw_lines[:, 0, :]:
+        a = np.array([float(seg[0]), float(seg[1])], dtype=np.float64)
+        b = np.array([float(seg[2]), float(seg[3])], dtype=np.float64)
+        if float(np.linalg.norm(b - a)) >= min_seg_len:
+            segments.append((a, b))
+
+    def segment_angle(seg: tuple[np.ndarray, np.ndarray]) -> float:
+        a, b = seg
+        return normalize_angle_degrees(float(np.degrees(np.arctan2(b[1] - a[1], b[0] - a[0]))))
+
+    def try_fuse(
+        seg1: tuple[np.ndarray, np.ndarray],
+        seg2: tuple[np.ndarray, np.ndarray],
+    ) -> tuple[bool, tuple[np.ndarray, np.ndarray] | None, float]:
+        a1, b1 = seg1
+        a2, b2 = seg2
+        angle1 = segment_angle(seg1)
+        angle2 = segment_angle(seg2)
+        if angle_diff_degrees(angle1, angle2) > angle_thresh:
+            return False, None, float("inf")
+
+        endpoint_pairs = [
+            (a1, a2),
+            (a1, b2),
+            (b1, a2),
+            (b1, b2),
+        ]
+        closest = min(endpoint_pairs, key=lambda pair: float(np.linalg.norm(pair[0] - pair[1])))
+        close_dist = float(np.linalg.norm(closest[0] - closest[1]))
+        if close_dist > endpoint_thresh:
+            return False, None, close_dist
+
+        # Prevent fusing adjacent but distinct parallels: endpoints must be near the opposite segment line.
+        if point_to_line_distance(closest[0], a2, b2) > collinear_thresh:
+            return False, None, close_dist
+        if point_to_line_distance(closest[1], a1, b1) > collinear_thresh:
+            return False, None, close_dist
+
+        # Merge by taking the two farthest endpoints among both segments.
+        endpoints = [a1, b1, a2, b2]
+        best_i, best_j = 0, 1
+        best_d = float(np.linalg.norm(endpoints[0] - endpoints[1]))
+        for i in range(4):
+            for j in range(i + 1, 4):
+                d = float(np.linalg.norm(endpoints[i] - endpoints[j]))
+                if d > best_d:
+                    best_d = d
+                    best_i, best_j = i, j
+
+        merged = (endpoints[best_i].copy(), endpoints[best_j].copy())
+        if float(np.linalg.norm(merged[1] - merged[0])) < min_seg_len:
+            return False, None, close_dist
+
+        return True, merged, close_dist
+
+    changed = True
+    while changed and len(segments) >= 2:
+        changed = False
+        best_merge: tuple[int, int, tuple[np.ndarray, np.ndarray], float] | None = None
+
+        for i in range(len(segments)):
+            for j in range(i + 1, len(segments)):
+                ok, merged, close_dist = try_fuse(segments[i], segments[j])
+                if not ok or merged is None:
+                    continue
+                if best_merge is None or close_dist < best_merge[3]:
+                    best_merge = (i, j, merged, close_dist)
+
+        if best_merge is not None:
+            i, j, merged_seg, _ = best_merge
+            new_segments: List[tuple[np.ndarray, np.ndarray]] = []
+            for idx, seg in enumerate(segments):
+                if idx not in (i, j):
+                    new_segments.append(seg)
+            new_segments.append(merged_seg)
+            segments = new_segments
+            changed = True
+
+    fused = np.zeros((len(segments), 1, 4), dtype=np.float32)
+    for i, (a, b) in enumerate(segments):
+        fused[i, 0, 0] = float(a[0])
+        fused[i, 0, 1] = float(a[1])
+        fused[i, 0, 2] = float(b[0])
+        fused[i, 0, 3] = float(b[1])
+    return fused
+
+
 def build_line_candidates(
     raw_lines: np.ndarray,
     click: np.ndarray,
@@ -514,12 +613,37 @@ def draw_ui(
     cv2.putText(canvas, text2, (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (30, 30, 30), 1, cv2.LINE_AA)
     return canvas, render
 
+
+def prompt_world_xyz() -> tuple[int, int, int]:
+    while True:
+        raw = input("Enter world x y z (integers): ").strip()
+        parts = raw.replace(",", " ").split()
+        if len(parts) != 3:
+            print("Expected exactly 3 integers: x y z")
+            continue
+        try:
+            x, y, z = (int(parts[0]), int(parts[1]), int(parts[2]))
+        except ValueError:
+            print("Invalid input. Use integers like: 12 64 -3")
+            continue
+        return x, y, z
+
+
+def append_known_point(csv_path: Path, screen_xy: np.ndarray, world_xyz: tuple[int, int, int]) -> None:
+    sx = float(screen_xy[0])
+    sy = float(screen_xy[1])
+    wx, wy, wz = world_xyz
+    with csv_path.open("a", encoding="utf-8", newline="") as f:
+        f.write(f"{sx:.6f},{sy:.6f},{wx},{wy},{wz}\n")
+
+
 def main() -> None:
     if not hasattr(cv2, "ximgproc"):
         raise RuntimeError("OpenCV contrib is required (cv2.ximgproc missing).")
 
     base_dir = Path(__file__).resolve().parent
-    image_path = "frame.png"
+    known_points_path = base_dir / "known_points.csv"
+    image_path = "known.png"
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"Failed to load image: {image_path}")
@@ -588,14 +712,16 @@ def main() -> None:
             state["cached_lines_full"] = []
             return
 
+        fused_raw = fuse_line_segments(raw, roi_channel.shape[:2])
+
         offset = np.array([float(x0), float(y0)], dtype=np.float64)
         lines_full: List[tuple[np.ndarray, np.ndarray]] = []
-        for seg in raw[:, 0, :]:
+        for seg in fused_raw[:, 0, :]:
             a = np.array([float(seg[0]), float(seg[1])], dtype=np.float64) + offset
             b = np.array([float(seg[2]), float(seg[3])], dtype=np.float64) + offset
             lines_full.append((a, b))
 
-        state["cached_raw_lines"] = raw
+        state["cached_raw_lines"] = fused_raw
         state["cached_roi_shape"] = roi_channel.shape[:2]
         state["cached_lines_full"] = lines_full
 
@@ -745,7 +871,10 @@ def main() -> None:
             # Manual fallback: if no lines are available, accept clicked point.
             if len(pending.lines) == 0:
                 refined = pending.click.astype(np.float64)
+                world_xyz = prompt_world_xyz()
+                append_known_point(known_points_path, refined, world_xyz)
                 print(f"Corner: ({refined[0]:.3f}, {refined[1]:.3f}) mode={pending.mode} source=manual")
+                print(f"Saved: screen=({refined[0]:.3f}, {refined[1]:.3f}) world=({world_xyz[0]}, {world_xyz[1]}, {world_xyz[2]})")
                 state["confirmed"].append(refined)
                 reset_to_full_view()
                 continue
@@ -758,7 +887,10 @@ def main() -> None:
 
             # In two-line mode, use the direct line intersection without extra refinement.
             corner_xy = corner.astype(np.float64)
+            world_xyz = prompt_world_xyz()
+            append_known_point(known_points_path, corner_xy, world_xyz)
             print(f"Corner: ({corner_xy[0]:.3f}, {corner_xy[1]:.3f}) mode={pending.mode} source=auto_intersection")
+            print(f"Saved: screen=({corner_xy[0]:.3f}, {corner_xy[1]:.3f}) world=({world_xyz[0]}, {world_xyz[1]}, {world_xyz[2]})")
             state["confirmed"].append(corner_xy)
             reset_to_full_view()
 
