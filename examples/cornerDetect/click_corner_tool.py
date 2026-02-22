@@ -398,6 +398,22 @@ def line_endpoint_away_from_point(line: LineCandidate, point: np.ndarray) -> np.
     return line.a if dist_a >= dist_b else line.b
 
 
+def select_two_closest_segments(
+    point_full: np.ndarray,
+    cached_lines_full: List[tuple[np.ndarray, np.ndarray]],
+) -> List[tuple[np.ndarray, np.ndarray]]:
+    if len(cached_lines_full) == 0:
+        return []
+
+    ranked: List[tuple[float, tuple[np.ndarray, np.ndarray]]] = []
+    for a_full, b_full in cached_lines_full:
+        d = point_to_segment_distance(point_full.astype(np.float64), a_full.astype(np.float64), b_full.astype(np.float64))
+        ranked.append((d, (a_full, b_full)))
+
+    ranked.sort(key=lambda item: item[0])
+    return [seg for _, seg in ranked[:2]]
+
+
 def draw_ui(
     base: np.ndarray,
     pending: PendingSelection | None,
@@ -405,6 +421,9 @@ def draw_ui(
     roi: tuple[int, int, int, int] | None,
     roi_scale: float,
     channel_mode: str,
+    show_all_lines: bool,
+    cached_lines_full: List[tuple[np.ndarray, np.ndarray]],
+    hover_full: np.ndarray | None,
     drag_start: tuple[int, int] | None,
     drag_current: tuple[int, int] | None,
 ) -> tuple[np.ndarray, dict[str, float] | None]:
@@ -448,6 +467,21 @@ def draw_ui(
     canvas = np.zeros((side, side, 3), dtype=np.uint8)
     canvas[pad_y : pad_y + disp_h, pad_x : pad_x + disp_w] = resized
 
+    if show_all_lines and hover_full is not None:
+        # Draw all cached segments in white.
+        for a_full, b_full in cached_lines_full:
+            ax, ay = full_to_roi_display(a_full, roi, render)
+            bx, by = full_to_roi_display(b_full, roi, render)
+            cv2.line(canvas, (ax, ay), (bx, by), (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Highlight the two nearest segments on top: red then green.
+        nearest = select_two_closest_segments(hover_full, cached_lines_full)
+        colors = [(0, 0, 255), (0, 255, 0)]  # red, green (BGR)
+        for i, (a_full, b_full) in enumerate(nearest):
+            ax, ay = full_to_roi_display(a_full, roi, render)
+            bx, by = full_to_roi_display(b_full, roi, render)
+            cv2.line(canvas, (ax, ay), (bx, by), colors[i % len(colors)], 2, cv2.LINE_AA)
+
     for pt in confirmed_points:
         if point_in_roi(pt, roi):
             cx, cy = full_to_roi_display(pt, roi, render)
@@ -472,7 +506,7 @@ def draw_ui(
         click_xy = full_to_roi_display(pending.click, roi, render)
         cv2.circle(canvas, click_xy, 4, (0, 255, 0), -1, cv2.LINE_AA)
 
-    text = f"ROI view ({mode_label}): LMB=2 lines | Space=confirm | Esc=full view | q=quit"
+    text = f"ROI view ({mode_label}): LMB=2 lines | hold RMB=2 nearest | Space=confirm | Esc=full view | q=quit"
     cv2.putText(canvas, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (230, 230, 230), 2, cv2.LINE_AA)
     cv2.putText(canvas, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (30, 30, 30), 1, cv2.LINE_AA)
     text2 = "Modes: g=gray a=avg z=R x=G c=B s=R-G d=B-Y f=sat"
@@ -499,6 +533,11 @@ def main() -> None:
         "roi_scale": 1.0,
         "roi_render": None,
         "channel_mode": "a",
+        "show_all_lines": False,
+        "cached_raw_lines": None,
+        "cached_roi_shape": None,
+        "cached_lines_full": [],
+        "hover_full": None,
         "drag_start": None,
         "drag_current": None,
     }
@@ -508,8 +547,57 @@ def main() -> None:
         state["roi"] = None
         state["roi_scale"] = 1.0
         state["roi_render"] = None
+        state["show_all_lines"] = False
+        state["cached_raw_lines"] = None
+        state["cached_roi_shape"] = None
+        state["cached_lines_full"] = []
+        state["hover_full"] = None
         state["drag_start"] = None
         state["drag_current"] = None
+
+    def refresh_roi_detection_cache() -> None:
+        roi = state["roi"]
+        if roi is None:
+            state["cached_raw_lines"] = None
+            state["cached_roi_shape"] = None
+            state["cached_lines_full"] = []
+            return
+
+        x0, y0, x1, y1 = roi
+        roi_bgr = image[y0:y1, x0:x1]
+        if roi_bgr.size == 0:
+            state["cached_raw_lines"] = None
+            state["cached_roi_shape"] = None
+            state["cached_lines_full"] = []
+            return
+
+        roi_channel = channel_from_mode(roi_bgr, str(state["channel_mode"]))
+        if roi_channel.size == 0:
+            state["cached_raw_lines"] = None
+            state["cached_roi_shape"] = None
+            state["cached_lines_full"] = []
+            return
+
+        length_thr = max(6.0, 0.02 * float(min(roi_channel.shape[0], roi_channel.shape[1])))
+        fld = cv2.ximgproc.createFastLineDetector(length_threshold=int(round(length_thr)), do_merge=True)
+        raw = fld.detect(roi_channel)
+
+        if raw is None or len(raw) == 0:
+            state["cached_raw_lines"] = np.empty((0, 1, 4), dtype=np.float32)
+            state["cached_roi_shape"] = roi_channel.shape[:2]
+            state["cached_lines_full"] = []
+            return
+
+        offset = np.array([float(x0), float(y0)], dtype=np.float64)
+        lines_full: List[tuple[np.ndarray, np.ndarray]] = []
+        for seg in raw[:, 0, :]:
+            a = np.array([float(seg[0]), float(seg[1])], dtype=np.float64) + offset
+            b = np.array([float(seg[2]), float(seg[3])], dtype=np.float64) + offset
+            lines_full.append((a, b))
+
+        state["cached_raw_lines"] = raw
+        state["cached_roi_shape"] = roi_channel.shape[:2]
+        state["cached_lines_full"] = lines_full
 
     def start_line_selection(full_x: int, full_y: int, mode: int) -> None:
         click_full = np.array([float(full_x), float(full_y)], dtype=np.float64)
@@ -518,28 +606,18 @@ def main() -> None:
             state["pending"] = None
             return
 
+        if state["cached_raw_lines"] is None or state["cached_roi_shape"] is None:
+            refresh_roi_detection_cache()
+
         x0, y0, x1, y1 = roi
-        roi_bgr = image[y0:y1, x0:x1]
-        if roi_bgr.size == 0:
-            state["pending"] = PendingSelection(click=click_full, mode=mode, lines=[])
-            return
-
-        roi_channel = channel_from_mode(roi_bgr, str(state["channel_mode"]))
-        if roi_channel.size == 0:
-            state["pending"] = PendingSelection(click=click_full, mode=mode, lines=[])
-            return
-
         click_local = np.array([float(full_x - x0), float(full_y - y0)], dtype=np.float64)
-
-        length_thr = max(6.0, 0.02 * float(min(roi_channel.shape[0], roi_channel.shape[1])))
-        fld = cv2.ximgproc.createFastLineDetector(length_threshold=int(round(length_thr)), do_merge=True)
-        # Original behavior: detect line segments directly on the selected single-channel image.
-        raw = fld.detect(roi_channel)
-        if raw is None or len(raw) == 0:
+        raw = state["cached_raw_lines"]
+        roi_shape = state["cached_roi_shape"]
+        if raw is None or roi_shape is None or len(raw) == 0:
             state["pending"] = PendingSelection(click=click_full, mode=mode, lines=[])
             return
 
-        local_candidates = build_line_candidates(raw, click_local, roi_channel.shape[:2], needed_count=mode)
+        local_candidates = build_line_candidates(raw, click_local, roi_shape, needed_count=mode)
         if not local_candidates:
             state["pending"] = PendingSelection(click=click_full, mode=mode, lines=[])
             return
@@ -559,7 +637,7 @@ def main() -> None:
                 )
             )
 
-        selected = select_diverse_lines(full_candidates, mode, roi_channel.shape[:2])
+        selected = select_diverse_lines(full_candidates, mode, roi_shape)
         state["pending"] = PendingSelection(
             click=click_full,
             mode=mode,
@@ -592,6 +670,8 @@ def main() -> None:
                 state["roi"] = rect
                 state["roi_scale"] = compute_roi_scale(image.shape, rect)
                 state["roi_render"] = None
+                state["show_all_lines"] = False
+                refresh_roi_detection_cache()
 
             return
 
@@ -600,11 +680,22 @@ def main() -> None:
             return
 
         if not in_roi_display_bounds(x, y, render):
+            state["hover_full"] = None
             return
+
+        if event == cv2.EVENT_MOUSEMOVE:
+            fx, fy = roi_display_to_full(x, y, roi, render)
+            state["hover_full"] = np.array([float(fx), float(fy)], dtype=np.float64)
 
         if event == cv2.EVENT_LBUTTONDOWN:
             fx, fy = roi_display_to_full(x, y, roi, render)
             start_line_selection(fx, fy, mode=2)
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            fx, fy = roi_display_to_full(x, y, roi, render)
+            state["hover_full"] = np.array([float(fx), float(fy)], dtype=np.float64)
+            state["show_all_lines"] = True
+        elif event == cv2.EVENT_RBUTTONUP:
+            state["show_all_lines"] = False
 
     window = "click_corner_tool"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -618,6 +709,9 @@ def main() -> None:
             roi=state["roi"],
             roi_scale=float(state["roi_scale"]),
             channel_mode=str(state["channel_mode"]),
+            show_all_lines=bool(state["show_all_lines"]),
+            cached_lines_full=list(state["cached_lines_full"]),
+            hover_full=state["hover_full"],
             drag_start=state["drag_start"],
             drag_current=state["drag_current"],
         )
@@ -630,6 +724,7 @@ def main() -> None:
 
         if key in (ord("g"), ord("a"), ord("z"), ord("x"), ord("c"), ord("s"), ord("d"), ord("f")):
             state["channel_mode"] = chr(key)
+            refresh_roi_detection_cache()
             # If a click is already pending, immediately recompute lines in the new mode.
             pending = state["pending"]
             if pending is not None and state["roi"] is not None:
