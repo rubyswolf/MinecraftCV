@@ -3,7 +3,7 @@
 import argparse
 import math
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, TypedDict
 
 import cv2
 import numpy as np
@@ -225,6 +225,240 @@ def as_int_points(quad: np.ndarray) -> List[Point]:
     return [(int(round(x)), int(round(y))) for x, y in quad.tolist()]
 
 
+class PointSample(TypedDict):
+    pt: np.ndarray
+    face: int
+    vidx: int
+
+
+class EdgeSample(TypedDict):
+    endpoint: np.ndarray
+    corner: np.ndarray
+    face: int
+    edge_label: str
+
+
+def infer_detection_scale(detections: List[np.ndarray]) -> float:
+    edge_lengths: List[float] = []
+    for quad in detections:
+        for i in range(4):
+            a = quad[i]
+            b = quad[(i + 1) % 4]
+            edge_lengths.append(float(np.linalg.norm(b - a)))
+    if not edge_lengths:
+        return 1.0
+    return float(np.median(np.array(edge_lengths, dtype=np.float32)))
+
+
+def cluster_samples(samples: List[PointSample], tolerance: float) -> List[dict[str, object]]:
+    clusters: List[dict[str, object]] = []
+    for sample in samples:
+        pt = sample["pt"]
+        best_idx = -1
+        best_dist = float("inf")
+        for idx, cluster in enumerate(clusters):
+            center = np.asarray(cluster["center"], dtype=np.float32)
+            distance = float(np.linalg.norm(pt - center))
+            if distance < best_dist:
+                best_dist = distance
+                best_idx = idx
+
+        if best_idx >= 0 and best_dist <= tolerance:
+            target_cluster = clusters[best_idx]
+            members = target_cluster["members"]
+            if isinstance(members, list):
+                members.append(sample)
+                pts = np.array([m["pt"] for m in members], dtype=np.float32)
+                target_cluster["center"] = pts.mean(axis=0)
+        else:
+            clusters.append({"center": pt.copy(), "members": [sample]})
+
+    return clusters
+
+
+def cluster_edge_samples(samples: List[EdgeSample], tolerance: float) -> List[dict[str, object]]:
+    clusters: List[dict[str, object]] = []
+    for sample in samples:
+        pt = sample["endpoint"]
+        best_idx = -1
+        best_dist = float("inf")
+        for idx, cluster in enumerate(clusters):
+            center = np.asarray(cluster["center"], dtype=np.float32)
+            distance = float(np.linalg.norm(pt - center))
+            if distance < best_dist:
+                best_dist = distance
+                best_idx = idx
+
+        if best_idx >= 0 and best_dist <= tolerance:
+            target_cluster = clusters[best_idx]
+            members = target_cluster["members"]
+            if isinstance(members, list):
+                members.append(sample)
+                pts = np.array([m["endpoint"] for m in members], dtype=np.float32)
+                target_cluster["center"] = pts.mean(axis=0)
+        else:
+            clusters.append({"center": pt.copy(), "members": [sample]})
+
+    return clusters
+
+
+def fit_line_from_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    if points.shape[0] < 2:
+        return None
+    line = cv2.fitLine(points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01)
+    vx, vy, x0, y0 = [float(v) for v in line.ravel().tolist()]
+    direction = np.array([vx, vy], dtype=np.float64)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-8:
+        return None
+    direction /= norm
+    point = np.array([x0, y0], dtype=np.float64)
+    return point, direction
+
+
+def least_squares_intersection(lines: List[tuple[np.ndarray, np.ndarray]]) -> np.ndarray | None:
+    if len(lines) < 2:
+        return None
+
+    a_rows = []
+    b_rows = []
+    for point, direction in lines:
+        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+        a_rows.append(normal)
+        b_rows.append(float(np.dot(normal, point)))
+
+    a = np.array(a_rows, dtype=np.float64)
+    b = np.array(b_rows, dtype=np.float64)
+    if np.linalg.matrix_rank(a) < 2:
+        return None
+
+    solution, *_ = np.linalg.lstsq(a, b, rcond=None)
+    return solution.astype(np.float64)
+
+
+def estimate_corner_from_faces(detections: List[np.ndarray]) -> np.ndarray | None:
+    if len(detections) < 3:
+        return None
+
+    faces = detections[:3]
+    scale = infer_detection_scale(faces)
+
+    # All tolerances are relative to inferred face scale.
+    tol_vertex = 0.07 * scale
+    tol_endpoint = 0.09 * scale
+    tol_residual = 0.03 * scale
+    tol_seed = 0.12 * scale
+
+    vertex_samples: List[PointSample] = []
+    for fidx, quad in enumerate(faces):
+        for vidx, pt in enumerate(quad):
+            vertex_samples.append({"pt": pt.astype(np.float32), "face": fidx, "vidx": vidx})
+
+    vertex_clusters = cluster_samples(vertex_samples, tol_vertex)
+    if not vertex_clusters:
+        return None
+
+    # Candidate corner: vertex cluster supported by all three faces with best compactness.
+    corner_cluster = None
+    for cluster in vertex_clusters:
+        members = cluster["members"]
+        if not isinstance(members, list):
+            continue
+        face_set = {int(member["face"]) for member in members}
+        if len(face_set) != 3:
+            continue
+        center = np.asarray(cluster["center"], dtype=np.float32)
+        mean_dist = float(
+            np.mean([np.linalg.norm(np.asarray(member["pt"], dtype=np.float32) - center) for member in members])
+        )
+        score = (len(members), -mean_dist)
+        if corner_cluster is None or score > corner_cluster[0]:
+            corner_cluster = (score, cluster)
+
+    if corner_cluster is None:
+        return None
+
+    corner_seed = np.asarray(corner_cluster[1]["center"], dtype=np.float32)
+
+    closest_corner_vertices: dict[int, tuple[int, np.ndarray]] = {}
+    for fidx, quad in enumerate(faces):
+        dists = [float(np.linalg.norm(pt - corner_seed)) for pt in quad]
+        best_vidx = int(np.argmin(np.array(dists, dtype=np.float32)))
+        if dists[best_vidx] > tol_vertex:
+            return None
+        closest_corner_vertices[fidx] = (best_vidx, quad[best_vidx].astype(np.float32))
+
+    edge_samples: List[EdgeSample] = []
+    for fidx, quad in enumerate(faces):
+        corner_vidx, corner_pt = closest_corner_vertices[fidx]
+        prev_idx = (corner_vidx - 1) % 4
+        next_idx = (corner_vidx + 1) % 4
+
+        edge_samples.append(
+            {
+                "endpoint": quad[prev_idx].astype(np.float32),
+                "corner": corner_pt,
+                "face": fidx,
+                "edge_label": "prev",
+            }
+        )
+        edge_samples.append(
+            {
+                "endpoint": quad[next_idx].astype(np.float32),
+                "corner": corner_pt,
+                "face": fidx,
+                "edge_label": "next",
+            }
+        )
+
+    endpoint_clusters = cluster_edge_samples(edge_samples, tol_endpoint)
+    if len(endpoint_clusters) != 3:
+        return None
+
+    # Correct trihedral pattern: three shared corner-incident edges, each seen by exactly two faces.
+    for cluster in endpoint_clusters:
+        members = cluster["members"]
+        if not isinstance(members, list) or len(members) != 2:
+            return None
+        faces_in_cluster = {int(member["face"]) for member in members}
+        if len(faces_in_cluster) != 2:
+            return None
+
+    lines: List[tuple[np.ndarray, np.ndarray]] = []
+    for cluster in endpoint_clusters:
+        members = cluster["members"]
+        if not isinstance(members, list):
+            continue
+        line_points: List[np.ndarray] = []
+        for member in members:
+            line_points.append(np.asarray(member["corner"], dtype=np.float32))
+            line_points.append(np.asarray(member["endpoint"], dtype=np.float32))
+        line_fit = fit_line_from_points(np.array(line_points, dtype=np.float32))
+        if line_fit is None:
+            return None
+        lines.append(line_fit)
+
+    if len(lines) != 3:
+        return None
+
+    corner = least_squares_intersection(lines)
+    if corner is None:
+        return None
+
+    # Consistency checks: intersection must stay close to local support and line residuals.
+    if float(np.linalg.norm(corner - corner_seed.astype(np.float64))) > tol_seed:
+        return None
+
+    residuals: List[float] = []
+    for point, direction in lines:
+        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+        residuals.append(abs(float(np.dot(normal, corner - point))))
+    if float(np.mean(np.array(residuals, dtype=np.float64))) > tol_residual:
+        return None
+
+    return corner.astype(np.float64)
+
+
 def write_overlay(output_path: Path, scene_shape: tuple[int, int, int], detections: List[np.ndarray]) -> None:
     overlay = np.zeros((scene_shape[0], scene_shape[1], 4), dtype=np.uint8)
     rng = np.random.default_rng()
@@ -250,7 +484,7 @@ def main() -> None:
             "Find repeated appearances of texture.png in cube.png and output transparent quadrilateral overlay."
         )
     )
-    parser.add_argument("--template", type=Path, default=Path("texture.png"))
+    parser.add_argument("--template", type=Path, default=Path("andesite.png"))
     parser.add_argument("--scene", type=Path, default=Path("cube.png"))
     parser.add_argument("--output", type=Path, default=Path("detection.png"))
     args = parser.parse_args()
@@ -277,6 +511,12 @@ def main() -> None:
             print(f"Detection {i}: {as_int_points(quad)}")
     else:
         print("No detections found.")
+
+    corner = estimate_corner_from_faces(detections)
+    if corner is not None:
+        print(f"Corner: ({corner[0]:.3f}, {corner[1]:.3f})")
+    else:
+        print("Corner: not found (faces did not form a scale-consistent trihedral corner).")
 
     write_overlay(output_path, scene_bgr.shape, detections)
 
