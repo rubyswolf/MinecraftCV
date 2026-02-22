@@ -59,6 +59,15 @@ def point_to_line_distance(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> f
     return cross / denom
 
 
+def project_point_to_line(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ab = b.astype(np.float64) - a.astype(np.float64)
+    denom = float(np.dot(ab, ab))
+    if denom < 1e-10:
+        return a.astype(np.float64).copy()
+    t = float(np.dot(point.astype(np.float64) - a.astype(np.float64), ab) / denom)
+    return a.astype(np.float64) + t * ab
+
+
 def intersect_two_lines(a1: np.ndarray, a2: np.ndarray, b1: np.ndarray, b2: np.ndarray) -> np.ndarray | None:
     matrix = np.array(
         [[a2[0] - a1[0], b1[0] - b2[0]], [a2[1] - a1[1], b1[1] - b2[1]]],
@@ -223,8 +232,12 @@ def select_diverse_lines(
 
 
 def estimate_corner_from_selection(selection: PendingSelection) -> np.ndarray | None:
-    if len(selection.lines) < 2:
+    if len(selection.lines) == 0:
         return None
+
+    if len(selection.lines) == 1:
+        line = selection.lines[0]
+        return project_point_to_line(selection.click, line.a, line.b)
 
     # Always use exact 2-line intersection when exactly two lines are selected.
     if len(selection.lines) == 2 or selection.mode == 2:
@@ -390,7 +403,7 @@ def draw_ui(
             cv2.circle(canvas, (cx, cy), 3, (0, 0, 255), -1, cv2.LINE_AA)
 
     if pending is not None:
-        preview_corner = estimate_corner_from_selection(pending) if len(pending.lines) >= 2 else None
+        preview_corner = estimate_corner_from_selection(pending)
         colors = [(255, 255, 0), (0, 255, 255), (255, 0, 255)]
         for i, line in enumerate(pending.lines):
             color = colors[i % len(colors)]
@@ -413,21 +426,12 @@ def draw_ui(
     cv2.putText(canvas, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (30, 30, 30), 1, cv2.LINE_AA)
     return canvas, render
 
-
-def choose_default_image(base_dir: Path) -> Path:
-    for name in ("frame.png", "corners.png"):
-        p = base_dir / name
-        if p.exists():
-            return p
-    return base_dir / "corners.png"
-
-
 def main() -> None:
     if not hasattr(cv2, "ximgproc"):
         raise RuntimeError("OpenCV contrib is required (cv2.ximgproc missing).")
 
     base_dir = Path(__file__).resolve().parent
-    image_path = choose_default_image(base_dir)
+    image_path = "frame.png"
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"Failed to load image: {image_path}")
@@ -571,8 +575,8 @@ def main() -> None:
             if pending is None:
                 continue
 
-            # Manual fallback: if fewer than 2 lines are available, accept clicked point.
-            if len(pending.lines) < 2:
+            # Manual fallback: if no lines are available, accept clicked point.
+            if len(pending.lines) == 0:
                 refined = pending.click.astype(np.float64)
                 print(f"Corner: ({refined[0]:.3f}, {refined[1]:.3f}) mode={pending.mode} source=manual")
                 state["confirmed"].append(refined)
