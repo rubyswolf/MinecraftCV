@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
+import re
 
 import cv2
 import numpy as np
+
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = BASE_DIR / "../examples/labeled/1/points.csv"
+GROUND_TRUTH_PATH = BASE_DIR / "../examples/labeled/1/ground_truth.txt"
+IMAGE_PATH = BASE_DIR / "../examples/labeled/1/original_image.png"
 
 
 def load_known_points(csv_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -172,17 +178,47 @@ def rmse_px(
     return float(np.sqrt(np.mean(err**2)))
 
 
-def main() -> None:
-    base_dir = Path(__file__).resolve().parent
-    csv_path = base_dir / "../examples/labeled/1/points.csv"
-    image_path = base_dir / "../examples/labeled/1/original_image.png"
+def parse_ground_truth(ground_truth_path: Path) -> tuple[np.ndarray, float, float]:
+    text = ground_truth_path.read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    pos_line = None
+    rot_line = None
+    for ln in lines:
+        low = ln.lower()
+        if low.startswith("position (camera"):
+            pos_line = ln
+        elif low.startswith("rotation:"):
+            rot_line = ln
+
+    if pos_line is None:
+        raise ValueError(f"Could not find camera position line in {ground_truth_path}")
+    if rot_line is None:
+        raise ValueError(f"Could not find rotation line in {ground_truth_path}")
+
+    pos_data = pos_line.split(": ", 1)[1] if ": " in pos_line else pos_line
+    rot_data = rot_line.split(": ", 1)[1] if ": " in rot_line else rot_line
+
+    pos_vals = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", pos_data)
+    rot_vals = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", rot_data)
+    if len(pos_vals) < 3:
+        raise ValueError(f"Expected 3 position values in: {pos_line}")
+    if len(rot_vals) < 2:
+        raise ValueError(f"Expected 2 rotation values in: {rot_line}")
+
+    gt_pos = np.array([float(pos_vals[0]), float(pos_vals[1]), float(pos_vals[2])], dtype=np.float64)
+    gt_yaw = float(rot_vals[0])
+    gt_pitch = float(rot_vals[1])
+    return gt_pos, gt_yaw, gt_pitch
+
+
+def main() -> None:
+    image = cv2.imread(str(IMAGE_PATH), cv2.IMREAD_COLOR)
     if image is None:
-        raise FileNotFoundError(f"Failed to load image: {image_path}")
+        raise FileNotFoundError(f"Failed to load image: {IMAGE_PATH}")
     h, w = image.shape[:2]
 
-    image_pts, object_pts = load_known_points(csv_path)
+    image_pts, object_pts = load_known_points(CSV_PATH)
 
     # Minecraft "Normal" FOV setting is 70; treat it as an initial vertical-FOV guess.
     initial_vfov_deg = 70.0
@@ -223,16 +259,16 @@ def main() -> None:
     rmse = rmse_px(object_pts, image_pts, best_rvec, best_tvec, k_best)
     cam_world, pitch_deg, yaw_deg = pose_to_camera_world_and_minecraft_angles(best_rvec, best_tvec)
 
-    # Ground truth provided by user.
-    # Minecraft rotation is normally yaw, pitch.
-    gt_pos = np.array([24.10319081385771, 33.71892840326218, 254.05654024039364], dtype=np.float64)
-    gt_yaw = 3.1681824
-    gt_pitch = 44.775566
-
-    pos_err = float(np.linalg.norm(cam_world - gt_pos))
-    pitch_err = abs(float(pitch_deg - gt_pitch))
-    yaw_err = abs(float(wrap_degrees(yaw_deg - gt_yaw)))
-    rot_combined_err = float(np.sqrt(pitch_err**2 + yaw_err**2))
+    gt_data: tuple[np.ndarray, float, float] | None = None
+    gt_notice: str | None = None
+    if GROUND_TRUTH_PATH.exists():
+        try:
+            # Minecraft rotation is yaw, pitch.
+            gt_data = parse_ground_truth(GROUND_TRUTH_PATH)
+        except Exception as exc:
+            gt_notice = f"Notice: failed to parse ground truth ({GROUND_TRUTH_PATH}): {exc}"
+    else:
+        gt_notice = f"Notice: ground truth not found at {GROUND_TRUTH_PATH}. Skipping error metrics."
 
     hfov_deg = float(np.degrees(2.0 * np.arctan((w * 0.5) / best_f)))
     vfov_deg = float(np.degrees(2.0 * np.arctan((h * 0.5) / best_f)))
@@ -246,6 +282,19 @@ def main() -> None:
     print()
     print(f"Predicted position: {cam_world[0]:.12f}, {cam_world[1]:.12f}, {cam_world[2]:.12f}")
     print(f"Predicted rotation (yaw, pitch): {yaw_deg:.7f}, {pitch_deg:.7f}")
+
+    if gt_data is None:
+        if gt_notice is not None:
+            print()
+            print(gt_notice)
+        return
+
+    gt_pos, gt_yaw, gt_pitch = gt_data
+    pos_err = float(np.linalg.norm(cam_world - gt_pos))
+    pitch_err = abs(float(pitch_deg - gt_pitch))
+    yaw_err = abs(float(wrap_degrees(yaw_deg - gt_yaw)))
+    rot_combined_err = float(np.sqrt(pitch_err**2 + yaw_err**2))
+
     print()
     print(f"Ground truth position: {gt_pos[0]:.12f}, {gt_pos[1]:.12f}, {gt_pos[2]:.12f}")
     print(f"Ground truth rotation (yaw, pitch): {gt_yaw:.7f}, {gt_pitch:.7f}")

@@ -7,6 +7,9 @@ from typing import List
 import cv2
 import numpy as np
 
+BASE_DIR = Path(__file__).resolve().parent
+TARGET_IMAGE_PATH = BASE_DIR / "../examples/images/corners.png"
+
 
 @dataclass
 class LineCandidate:
@@ -641,12 +644,10 @@ def main() -> None:
     if not hasattr(cv2, "ximgproc"):
         raise RuntimeError("OpenCV contrib is required (cv2.ximgproc missing).")
 
-    base_dir = Path(__file__).resolve().parent
-    known_points_path = base_dir / "points.csv"
-    image_path = "../examples/images/corners.png"
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    known_points_path = BASE_DIR / "points.csv"
+    image = cv2.imread(str(TARGET_IMAGE_PATH), cv2.IMREAD_COLOR)
     if image is None:
-        raise FileNotFoundError(f"Failed to load image: {image_path}")
+        raise FileNotFoundError(f"Failed to load image: {TARGET_IMAGE_PATH}")
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
