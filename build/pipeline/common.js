@@ -1,0 +1,155 @@
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const esbuild = require("esbuild");
+
+const ROOT_DIR = path.resolve(__dirname, "..", "..");
+const SRC_DIR = path.join(ROOT_DIR, "src");
+const DIST_DIR = path.join(ROOT_DIR, "dist");
+const DIST_COMMON_DIR = path.join(DIST_DIR, "common");
+
+async function ensureDir(dirPath) {
+  await fs.mkdir(dirPath, { recursive: true });
+}
+
+async function buildCommonArtifacts() {
+  await ensureDir(DIST_COMMON_DIR);
+
+  const appEntry = path.join(SRC_DIR, "app.ts");
+  const htmlTemplatePath = path.join(SRC_DIR, "template.html");
+  const appBundlePath = path.join(DIST_COMMON_DIR, "app.bundle.js");
+  const inlineHtmlPath = path.join(DIST_COMMON_DIR, "index.inline.html");
+
+  const result = await esbuild.build({
+    entryPoints: [appEntry],
+    bundle: true,
+    minify: true,
+    format: "iife",
+    platform: "browser",
+    target: ["es2020"],
+    legalComments: "none",
+    write: false,
+    logLevel: "silent",
+  });
+
+  const appBundle = result.outputFiles[0].text;
+  await fs.writeFile(appBundlePath, appBundle, "utf8");
+
+  const template = await fs.readFile(htmlTemplatePath, "utf8");
+  const safeInlineBundle = appBundle.replace(/<\/script/gi, "<\\/script");
+  const inlineHtml = template.replace("__APP_JS__", safeInlineBundle);
+  await fs.writeFile(inlineHtmlPath, inlineHtml, "utf8");
+
+  return {
+    rootDir: ROOT_DIR,
+    distDir: DIST_DIR,
+    distCommonDir: DIST_COMMON_DIR,
+    appBundlePath,
+    inlineHtmlPath,
+    appBundle,
+    inlineHtml,
+  };
+}
+
+function renderPythonStandaloneScript(inlineHtml) {
+  const htmlAsPythonString = JSON.stringify(inlineHtml);
+  return `#!/usr/bin/env python3
+import sys
+
+try:
+    from flask import Flask, Response, jsonify, request
+except ImportError as exc:
+    print(f"Missing dependency: {exc.name}")
+    print("Install requirements with:")
+    print(f"  {sys.executable} -m pip install -r requirements-python-standalone.txt")
+    raise SystemExit(1)
+
+try:
+    import cv2
+    import numpy as np
+except ImportError as exc:
+    print(f"Missing dependency: {exc.name}")
+    print("Install requirements with:")
+    print(f"  {sys.executable} -m pip install -r requirements-python-standalone.txt")
+    raise SystemExit(1)
+
+HTML_PAGE = ${htmlAsPythonString}
+
+app = Flask(__name__)
+
+
+def handle_opencv_test(_args):
+    rgb = np.array([[[255, 0, 0], [0, 255, 0], [0, 0, 255]]], dtype=np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    return {
+        "opencv_version": cv2.__version__,
+        "gray_values": gray.reshape(-1).tolist(),
+        "shape": [int(gray.shape[0]), int(gray.shape[1])],
+        "mean_gray": float(np.mean(gray)),
+    }
+
+
+@app.get("/api/health")
+def api_health():
+    return jsonify({
+        "ok": True,
+        "backend": "python-cv2",
+        "opencv_version": cv2.__version__,
+    })
+
+
+@app.post("/api/cv")
+def api_cv():
+    payload = request.get_json(silent=True) or {}
+    op = payload.get("op")
+    args = payload.get("args") or {}
+
+    if op == "opencvTest":
+        return jsonify({"ok": True, "data": handle_opencv_test(args)})
+
+    return (
+        jsonify(
+            {
+                "ok": False,
+                "error": {
+                    "code": "UNKNOWN_OP",
+                    "message": f"Unsupported operation: {op}",
+                },
+            }
+        ),
+        400,
+    )
+
+
+@app.get("/")
+def index():
+    return Response(HTML_PAGE, mimetype="text/html")
+
+
+def parse_port(argv):
+    if len(argv) < 2:
+        return 8765
+    try:
+        return int(argv[1])
+    except ValueError:
+        return 8765
+
+
+if __name__ == "__main__":
+    host = "127.0.0.1"
+    port = parse_port(sys.argv)
+    url = f"http://{host}:{port}/"
+    print("MinecraftCV Python standalone server is running.")
+    print("Open this link in your browser:")
+    print(url)
+    app.run(host=host, port=port, debug=False)
+`;
+}
+
+module.exports = {
+  ROOT_DIR,
+  DIST_DIR,
+  DIST_COMMON_DIR,
+  ensureDir,
+  buildCommonArtifacts,
+  renderPythonStandaloneScript,
+};

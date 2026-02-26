@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MinecraftCV Python Standalone</title>
+  <style>
+    :root {
+      --bg: #101419;
+      --panel: #1a222c;
+      --text: #e8f0fa;
+      --muted: #9bb0c8;
+      --accent: #65d6a6;
+      --border: #2e3d4f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: radial-gradient(1200px 600px at 30% -10%, #233247, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+    .card {
+      width: min(900px, 100%);
+      background: linear-gradient(180deg, #1c2631, var(--panel));
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 18px 16px;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.2rem;
+      font-weight: 650;
+    }
+    p {
+      margin: 0 0 14px;
+      color: var(--muted);
+    }
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    button {
+      background: var(--accent);
+      color: #082014;
+      border: 0;
+      border-radius: 8px;
+      font-weight: 650;
+      padding: 9px 14px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .status {
+      margin-bottom: 10px;
+      color: var(--muted);
+      min-height: 1.2em;
+    }
+    pre {
+      margin: 0;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0f151c;
+      overflow: auto;
+      min-height: 180px;
+      color: #d7e7fb;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>MinecraftCV Python Standalone (Placeholder)</h1>
+    <p>Click the button to call the local Flask OpenCV API and validate backend wiring.</p>
+    <div class="controls">
+      <button id="test-button" type="button">Run OpenCV Test</button>
+    </div>
+    <div id="status" class="status">Waiting for backend health check...</div>
+    <pre id="output">No results yet.</pre>
+  </main>
+  <script>
+__APP_JS__
+  </script>
+</body>
+</html>

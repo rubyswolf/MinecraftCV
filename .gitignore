@@ -1,1 +1,3 @@
 build/opencv_js_mcv_single
+node_modules
+dist

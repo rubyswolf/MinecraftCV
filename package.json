@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "build:python": "node build/build.js --target python",
+    "build:web": "node build/build.js --target web"
+  },
+  "dependencies": {
+    "esbuild": "^0.27.3",
+    "tsc": "^2.0.4"
+  }
+}
