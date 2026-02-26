@@ -150,7 +150,7 @@ async function buildWebTarget(options = {}) {
   const videoApiUrl =
     typeof commonConfig.video_api_url === "string" && commonConfig.video_api_url.trim()
       ? commonConfig.video_api_url
-      : "/mcv/videos";
+      : "";
 
   const commonArtifacts = await buildCommonArtifacts({
     backendMode: "web",

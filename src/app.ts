@@ -28,6 +28,20 @@ type McvOpencvTestResult = {
   mean_gray: number;
 };
 
+type McvClientApi = {
+  callMcvApi: typeof callMcvApi;
+  fetchVideoCatalog: typeof fetchVideoCatalog;
+  hasVideoApiUrl: typeof hasVideoApiUrl;
+  backend: "python" | "web";
+  videoApiUrl: string;
+};
+
+declare global {
+  interface Window {
+    MCV_API?: McvClientApi;
+  }
+}
+
 declare const __MCV_BACKEND__: "python" | "web";
 declare const __MCV_OPENCV_URL__: string;
 declare const __MCV_VIDEO_API_URL__: string;
@@ -172,6 +186,24 @@ async function callMcvApi<TData>(requestBody: McvRequest): Promise<McvResponse<T
   }
 }
 
+async function fetchVideoCatalog(): Promise<Response> {
+  return fetch(__MCV_VIDEO_API_URL__);
+}
+
+function hasVideoApiUrl(): boolean {
+  return typeof __MCV_VIDEO_API_URL__ === "string" && __MCV_VIDEO_API_URL__.trim().length > 0;
+}
+
+function installGlobalApi(): void {
+  window.MCV_API = {
+    callMcvApi,
+    fetchVideoCatalog,
+    hasVideoApiUrl,
+    backend: __MCV_BACKEND__,
+    videoApiUrl: __MCV_VIDEO_API_URL__,
+  };
+}
+
 function setStatus(message: string): void {
   const statusNode = document.getElementById("status");
   if (statusNode) {
@@ -254,6 +286,7 @@ function installUiHandlers(): void {
 }
 
 function bootstrap(): void {
+  installGlobalApi();
   installUiHandlers();
   void checkHealth();
 }

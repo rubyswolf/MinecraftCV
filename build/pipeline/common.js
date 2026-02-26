@@ -19,9 +19,9 @@ async function buildCommonArtifacts() {
       ? options.opencvUrl
       : "/opencv.js";
   const videoApiUrl =
-    typeof options.videoApiUrl === "string" && options.videoApiUrl.trim()
+    typeof options.videoApiUrl === "string"
       ? options.videoApiUrl
-      : "/mcv/videos";
+      : "";
 
   await ensureDir(DIST_COMMON_DIR);
 

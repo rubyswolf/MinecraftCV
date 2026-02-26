@@ -1,6 +1,5 @@
 {
   "common": {
-    "video_api_url": "/mcv/videos",
     "website_url": "https://dartjs.com"
   },
   "web": {

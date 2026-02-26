@@ -1,34 +1,34 @@
 # What does MCV do?
 
-Minecraft Computer Vision (MCV) is a tool for recreating Minecraft player poses based on images/video. It allows you to label points on a Minecraft world image with edge detection assistance and where those points lie ingame then use the data to solve the PnP problem, which is the problem of estimating the camera pose and focal length from 2D-3D correspondences. This tool was created to assist in collecting evidence for the Dream MCC 11 Parkour cheating contraversy but it can be used for many other applications, for both of these reasons it is open source and free to use for anyone.
+Minecraft Computer Vision (MCV) is a tool for recreating Minecraft player poses from images and video. It lets you label points on a Minecraft world image with edge-detection assistance, pair those points with in-game world coordinates, and then solve the PnP problem (estimating camera pose and focal length from 2D-3D correspondences). This tool was created to assist in collecting evidence for the Dream MCC 11 Parkour cheating controversy, but it can be used for many other applications. For those reasons, it is open source and free for anyone to use.
 
 # Applications
 
 - Detecting cheating from gameplay footage by accurately tracking player movements, mainly useful for parkour
-- Recreating maps more accurately by using an already recreated section to align the camera pose and focal length and then using that to help construct the rest of the map very precisely without having to try to manually line up your view.
-  - Map recreations are also helpful for seedcracking and have been used before to find the seeds of PewDiePie's survival world as well as the pack.png placeholder texture's world.
+- Recreating maps more accurately by using an already recreated section to align camera pose and focal length, then using that alignment to construct the rest of the map very precisely without manually lining up your view.
+  - Map recreations are also helpful for seed cracking, and have been used before to find the seeds of PewDiePie's survival world as well as the world from the `pack.png` placeholder texture.
 
 # But what about tick alignment?
 
 Minecraft linearly interpolates player movement between ticks, meaning a single screenshot does not have enough information to determine the location a player actually was on a tick boundary, just a sample along the line they were travelling on.
-However if you have video and the framerate is at least 40FPS then this problem can be solved.
+However, if you have video and the frame rate is at least 40 FPS, this problem can be solved.
 
-To solve this problem you first need frame level tick alignment, the best way to extrapolate this data is through animated textures like fire and particle effects like running particles as the animation swaps frames on each tick boundary. MCV can be used to label such frame change events by drawing a box around the animated texture spotted one tick before and after it changes to show where you got the data from. This tells you which two frames a tick occured between.
+To solve this problem, you first need frame-level tick alignment. The best way to extrapolate this data is through animated textures (like fire) and particle effects (like running particles), because those animations swap frames on each tick boundary. MCV can be used to label these frame-change events by drawing a box around the animated texture one tick before and one tick after it changes, so you can show where the data came from. This tells you which two frames a tick occurred between.
 
-From this you can isolate which frames lie on a line segment between tick locations, by sampling all available points along a line (2 for 40FPS+, 3 for 60FPS+ etc) for two consecutive line segments, you can use find the intersection of the two line segments to find the tick boundary location with subframe accuracy by using a least squares regression solver.
+From this, you can isolate which frames lie on a line segment between tick locations. By sampling all available points along a line (2 for 40 FPS+, 3 for 60 FPS+, etc.) for two consecutive line segments, you can find the intersection of those line segments to estimate the tick-boundary location with subframe accuracy using a least-squares regression solver.
 
 # Finding the world coordinates
 
-To find the world coordinates of a point you can use the debug mode (F3) and stand ontop of a corner and look straight down and crouch to align your cursor with the corner. Your player coordinates will then be the world coordinates of that corner. If you can't stand directly ontop of a block because it has stuff above it then you can either break what's above it and replace it later or alternatively measure a different corner and shift it by the appropriate amount to get the coordinates of the corner you want.
+To find the world coordinates of a point, you can use debug mode (`F3`), stand on top of a corner, look straight down, and crouch to align your cursor with the corner. Your player coordinates will then be the world coordinates of that corner. If you cannot stand directly on top of a block because something is above it, you can either break what is above it and replace it later, or measure a different corner and shift it by the appropriate amount to get the coordinates you want.
 
-In the future I hope to make an either server or client side tool that lets you actually walk up to a corner and click it to automatically get the world coordinates or maybe a 3D voxel viewer where you can import the world or structure NBT and let you click on corners in that to get the world coordinates.
+In the future, I hope to make either a server-side or client-side tool that lets you walk up to a corner and click it to automatically get world coordinates, or a 3D voxel viewer where you can import a world or structure NBT and click corners to get coordinates.
 
 # What's included in the repo?
 
 - /examples
-  - /labeled: Some real examples of labelled points and their corresponding world coordinates along with the original images and ground truths for testing the PnP system.
+  - /labeled: Some real examples of labeled points and their corresponding world coordinates, along with the original images and ground truths for testing the PnP system.
   - /images: Some random images that can be used for testing the corner selector tool and edge detection.
-- /python_prototype: My first working prototype of the corner selector tool and PnP solver written in python using OpenCV.
+- /python_prototype: My first working prototype of the corner selector tool and PnP solver, written in Python using OpenCV.
 
 # Build
 
@@ -47,9 +47,9 @@ npm run build:python
 npm run build:web
 ```
 
-The python target is a standalone script hosting a flask server locally using the offical OpenCV python library.
+The Python target is a standalone script that hosts a local Flask server using the official OpenCV Python library.
 The web target is an embeddable React component that can be used in websites.
-The web target depends on OpenCV.js which is not bundled with the app, you need to build it yourself using the provided `build_opencv_js_single.py` and host it on your website or use a CDN version.
+The web target depends on OpenCV.js, which is not bundled with the app. You need to build it yourself using `build_opencv_js_single.py` and host it on your website, or use a CDN version.
 
 - `build:web` outputs:
   - `dist/common/app.bundle.js`
@@ -65,19 +65,53 @@ Build config is in `build/config.json`:
 
 - `common`:
   - `video_api_url`: relative API path (example: `/mcv/videos`)
-  - `website_url`: absolute site base URL (example: `https://dartjs.com`)
+  - `website_url`: absolute site base URL for the video API (example: `https://dartjs.com`)
 - `web`:
   - `site_root`: root of your website project, all other web paths are relative to this
   - `component_dest`: destination folder for `MCV.tsx`
   - `opencv_dest`: destination folder for `opencv.js` (optional if you don't build it yourself)
   - `opencv_url`: runtime URL used by the app to load OpenCV.js (example: `/opencv.js`)
 - `python`:
-  - reserved for python-target settings
+  - reserved for Python-target settings
 
 Video API behavior:
 
 - Web target uses `common.video_api_url` directly (relative path, works on localhost/dev).
 - Python uses an absolute path constructed by combining `common.website_url` and `common.video_api_url`.
+- If `common.video_api_url` is omitted, video API access is disabled by default.
+
+## Video API Schema (DIY)
+
+MCV does not ship with a hosted video API. You need to implement this endpoint on your own website/backend.
+
+Expected endpoint:
+
+- `GET {video_api_url}`
+
+Example of an expected JSON response:
+
+```json
+{
+  "videos": {
+    "mcc11-dream-parkour": {
+      "name": "Dream MCC 11 Parkour",
+      "url": "https://example.com/videos/mcc11-dream-parkour.mp4",
+      "youtube_id": "dQw4w9WgXcQ"
+    }
+  }
+}
+```
+
+Schema notes:
+
+- `videos`: required object
+- each key in videos is your custom stable video ID
+- each value:
+  - `name` (required string): display name
+  - `url` (required string): direct playable video URL (raw file URL, not a YouTube/Vimeo/etc. page)
+  - `youtube_id` (optional string): source YouTube ID when applicable
+
+This API is intentionally simple and provider-agnostic. You can back it with R2, S3, local files, or any other storage, as long as the returned `url` is accesible to your MCV target.
 
 ## Build OpenCV.js
 
@@ -112,6 +146,6 @@ Whitelist used for exported JS bindings:
 
 # Coming soon
 
-I plan to host a version of the tool on my website https://dartjs.com specifically for collecting evidence for the Dream controversy so that together we can crowdsource the data collection and publicly publish the data for anyone to analyse and I plan to analyse the data myself as well and publish the results and share it with youtubers to present the evidence in an easy to understand way.
+I plan to host a version of the tool on my website, https://dartjs.com, specifically for collecting evidence for the Dream controversy so we can crowdsource data collection and publish the data publicly for anyone to analyze. I also plan to analyze the data myself, publish the results, and share them with YouTubers to present the evidence in an easy-to-understand way.
 
 Let's find out whether or not he cheated together!

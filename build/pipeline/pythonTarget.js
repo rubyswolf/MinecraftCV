@@ -32,7 +32,7 @@ async function buildPythonTarget(options = {}) {
   const relativeVideoApiUrl =
     typeof commonConfig.video_api_url === "string" && commonConfig.video_api_url.trim()
       ? commonConfig.video_api_url
-      : "/mcv/videos";
+      : "";
   const websiteUrl =
     typeof commonConfig.website_url === "string" && commonConfig.website_url.trim()
       ? commonConfig.website_url
@@ -41,7 +41,7 @@ async function buildPythonTarget(options = {}) {
 
   const commonArtifacts = await buildCommonArtifacts({
     backendMode: "python",
-    videoApiUrl: absoluteVideoApiUrl || relativeVideoApiUrl,
+    videoApiUrl: absoluteVideoApiUrl || relativeVideoApiUrl || "",
   });
   await ensureDir(DIST_PYTHON_DIR);
 
