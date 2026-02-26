@@ -2,6 +2,10 @@
 
 Minecraft Computer Vision (MCV) is a tool for recreating Minecraft player poses from images and video. It lets you label points on a Minecraft world image with edge-detection assistance, pair those points with in-game world coordinates, and then solve the PnP problem (estimating camera pose and focal length from 2D-3D correspondences). This tool was created to assist in collecting evidence for the Dream MCC 11 Parkour cheating controversy, but it can be used for many other applications. For those reasons, it is open source and free for anyone to use.
 
+# Where does it run?
+
+MCV targets both Python and Web and provides maximum flexibility, allowing you to run it entirely online or entirely offline. The web version is a React component that can be embedded in any website, and the Python version is a standalone script that hosts a local Flask server. Both versions have the same core functionality and can be used to label points, solve PnP, and process the data to find positions on tick boundaries and export your findings.
+
 # Applications
 
 - Detecting cheating from gameplay footage by accurately tracking player movements, mainly useful for parkour
