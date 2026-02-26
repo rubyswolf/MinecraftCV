@@ -233,7 +233,9 @@ def main() -> None:
     if args.simd:
         cmd.append("--simd")
     if args.suppress_deprecated_warnings:
-        cmd.append("--build_flags=-Wno-deprecated-declarations -Wno-deprecated-pragma")
+        cmd.append(
+            "--build_flags=-Wno-deprecated-declarations -Wno-deprecated-pragma -Wno-unused-command-line-argument"
+        )
     if args.clean:
         cmd.append("--clean_build_dir")
 
@@ -254,7 +256,10 @@ def main() -> None:
         print("- Emscripten path was not auto-detected.")
     print("- This command builds single-file output (no --disable_single_file).")
     if args.suppress_deprecated_warnings:
-        print("- Deprecated warning spam is suppressed (-Wno-deprecated-declarations -Wno-deprecated-pragma).")
+        print(
+            "- Warning spam is suppressed "
+            "(-Wno-deprecated-declarations -Wno-deprecated-pragma -Wno-unused-command-line-argument)."
+        )
     print("- Expected output file: <output-dir>/bin/opencv.js")
 
     build_cmd = [

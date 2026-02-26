@@ -23,6 +23,7 @@ core = {
         "split",
         "normalize",
     ],
+    "Algorithm": [],
 }
 
 imgproc = {

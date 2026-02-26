@@ -12,3 +12,41 @@ You will need a minimum of about 8 points but the more the better, and you shoul
 # pnp_solver.py
 
 This is a tool for solving the PnP problem using OpenCV. It takes in a csv file of the format `screen x, screen y, world x, world y, world z` and the image dimensions uses the 2D-3D correspondences to estimate the camera pose and focal length. The results are printed to the console. You can test it out with the provided examples in the `examples/labeled` folder which have already been labeled with the corner selector tool and the first example is already set up and ready to go. You can also try it out with your own examples by creating your own csv files in the same format. It optionally takes in a ground truth text document (format provided in example) to calculate the error of the predictions compared to the ground truth.
+
+# benchmarks/
+
+Benchmark scripts now live in `python_prototype/benchmarks`.
+
+## Main comparison
+
+`benchmark_compare_cvtcolor.py` runs a consolidated comparison of:
+- Python OpenCV `cv2.cvtColor`
+- OpenCV.js `cv.cvtColor`
+- Manual JavaScript weighted grayscale
+
+Run:
+
+```bash
+python python_prototype/benchmarks/benchmark_compare_cvtcolor.py --iterations 5000 --warmup 150 --repeats 5
+```
+
+Optional args:
+- `--width` and `--height` (default `1280x720`)
+- `--opencv-js-path` (default `build/opencv_js_mcv_single/bin/opencv.js`)
+
+## Individual benchmark scripts
+
+- Python cvtColor only:
+```bash
+python python_prototype/benchmarks/benchmark_python_cvtcolor_only.py --iterations 2000 --warmup 100
+```
+
+- OpenCV.js cvtColor only:
+```bash
+node python_prototype/benchmarks/benchmark_opencv_js_cvtcolor_only.mjs build/opencv_js_mcv_single/bin/opencv.js --iterations 2000 --warmup 100
+```
+
+- Manual JS weighted grayscale only:
+```bash
+node python_prototype/benchmarks/benchmark_manual_gray_js.mjs --iterations 2000 --warmup 100
+```
