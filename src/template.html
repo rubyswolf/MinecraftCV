@@ -42,6 +42,23 @@ __MCV_BODY_STYLE__
       gap: 10px;
       margin-bottom: 14px;
     }
+    .search-input {
+      width: 100%;
+      margin-bottom: 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #111821;
+      color: var(--text);
+      padding: 10px 12px;
+      font-size: 0.95rem;
+      outline: none;
+    }
+    .search-input:focus {
+      border-color: #4f6a85;
+    }
+    .search-input::placeholder {
+      color: var(--muted);
+    }
     .tab-button {
       background: #111821;
       color: var(--text);
@@ -80,10 +97,21 @@ __MCV_BODY_STYLE__
       padding: 10px;
       background: #141d27;
     }
-    .media-title {
+    .media-title-button {
+      font: inherit;
       font-weight: 650;
+      color: #9fd4ff;
+      background: transparent;
+      border: 0;
+      padding: 0;
       margin-bottom: 6px;
+      cursor: pointer;
+      text-align: left;
+      width: 100%;
       word-break: break-word;
+    }
+    .media-title-button:hover {
+      text-decoration: underline;
     }
     .media-meta {
       color: var(--muted);
@@ -99,6 +127,32 @@ __MCV_BODY_STYLE__
     .media-link:hover {
       text-decoration: underline;
     }
+    .selected-media {
+      display: grid;
+      gap: 10px;
+    }
+    .selected-title {
+      font-size: 1rem;
+      font-weight: 700;
+      word-break: break-word;
+    }
+    .selected-line {
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .back-button {
+      justify-self: start;
+      background: #111821;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-weight: 650;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    .back-button:hover {
+      background: #1a2633;
+    }
   </style>
 </head>
 <body>
@@ -108,6 +162,7 @@ __MCV_BODY_STYLE__
       <button id="tab-videos" class="tab-button active" type="button">Videos</button>
       <button id="tab-images" class="tab-button" type="button">Images</button>
     </div>
+    <input id="media-search" class="search-input" type="text" placeholder="URL/search query" />
     <div id="media-box" class="media-box">loading...</div>
   </main>
 __BACKEND_SCRIPTS__

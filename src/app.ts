@@ -67,6 +67,12 @@ type MediaLibrary = {
   images: Record<string, MediaImageEntry>;
 };
 
+type SelectedMedia = {
+  tab: MediaTab;
+  id: string;
+  item: MediaVideoEntry | MediaImageEntry;
+};
+
 declare global {
   interface Window {
     MCV_API?: McvClientApi;
@@ -81,6 +87,8 @@ declare const __MCV_DATA_API_URL__: string;
 let cvPromise: Promise<unknown> | null = null;
 let activeMediaTab: MediaTab = "videos";
 let mediaLoadState: MediaLoadState = "loading";
+let mediaSearchQuery = "";
+let selectedMedia: SelectedMedia | null = null;
 let mediaLibrary: MediaLibrary = {
   videos: {},
   images: {},
@@ -349,17 +357,45 @@ function setTabButtonState(): void {
   imagesButton.classList.toggle("active", !isVideos);
 }
 
+function normalizeSearchToken(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function matchesSearch(haystackValues: string[]): boolean {
+  const query = normalizeSearchToken(mediaSearchQuery);
+  if (!query) {
+    return true;
+  }
+  return haystackValues.some((value) => normalizeSearchToken(value).includes(query));
+}
+
 function renderMediaList(): void {
   const mediaBoxNode = getMediaBoxNode();
   if (!mediaBoxNode) {
     return;
   }
-  const mediaEntries =
+  const rawMediaEntries =
     activeMediaTab === "videos"
       ? Object.entries(mediaLibrary.videos)
       : Object.entries(mediaLibrary.images);
+  const mediaEntries =
+    activeMediaTab === "videos"
+      ? rawMediaEntries.filter(([id, item]) =>
+          matchesSearch([
+            id,
+            item.name,
+            item.url,
+            "youtube_id" in item && item.youtube_id ? item.youtube_id : "",
+          ])
+        )
+      : rawMediaEntries.filter(([id, item]) => matchesSearch([id, item.name, item.url]));
 
   if (mediaEntries.length === 0) {
+    const hasQuery = normalizeSearchToken(mediaSearchQuery).length > 0;
+    if (hasQuery) {
+      setMediaMessage(activeMediaTab === "videos" ? "No matching videos found." : "No matching images found.");
+      return;
+    }
     setMediaMessage(activeMediaTab === "videos" ? "No videos found." : "No images found.");
     return;
   }
@@ -371,15 +407,20 @@ function renderMediaList(): void {
     const listItemNode = document.createElement("li");
     listItemNode.className = "media-item";
 
-    const titleNode = document.createElement("div");
-    titleNode.className = "media-title";
+    const titleNode = document.createElement("button");
+    titleNode.type = "button";
+    titleNode.className = "media-title-button";
     titleNode.textContent = item.name;
+    titleNode.addEventListener("click", () => {
+      selectedMedia = { tab: activeMediaTab, id, item };
+      renderMediaBox();
+    });
 
     const metaNode = document.createElement("div");
     metaNode.className = "media-meta";
     metaNode.textContent = id;
     if (activeMediaTab === "videos" && "youtube_id" in item && item.youtube_id) {
-      const separatorNode = document.createTextNode(" • YouTube: ");
+      const separatorNode = document.createTextNode(" | YouTube: ");
       const youtubeLinkNode = document.createElement("a");
       const youtubeUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(item.youtube_id)}`;
       configureExternalLink(youtubeLinkNode, youtubeUrl, item.youtube_id);
@@ -399,6 +440,42 @@ function renderMediaList(): void {
   mediaBoxNode.replaceChildren(listNode);
 }
 
+function renderSelectedMediaPlaceholder(): void {
+  const mediaBoxNode = getMediaBoxNode();
+  if (!mediaBoxNode || !selectedMedia) {
+    return;
+  }
+
+  const container = document.createElement("div");
+  container.className = "selected-media";
+
+  const titleNode = document.createElement("div");
+  titleNode.className = "selected-title";
+  titleNode.textContent = `Selected ${selectedMedia.tab === "videos" ? "Video" : "Image"}: ${selectedMedia.item.name}`;
+
+  const idNode = document.createElement("div");
+  idNode.className = "selected-line";
+  idNode.textContent = `ID: ${selectedMedia.id}`;
+
+  const urlNode = document.createElement("a");
+  configureExternalLink(urlNode, selectedMedia.item.url, selectedMedia.item.url);
+
+  const backButton = document.createElement("button");
+  backButton.type = "button";
+  backButton.className = "back-button";
+  backButton.textContent = "Back";
+  backButton.addEventListener("click", () => {
+    selectedMedia = null;
+    renderMediaBox();
+  });
+
+  container.appendChild(titleNode);
+  container.appendChild(idNode);
+  container.appendChild(urlNode);
+  container.appendChild(backButton);
+  mediaBoxNode.replaceChildren(container);
+}
+
 function renderMediaBox(): void {
   if (mediaLoadState === "no_api") {
     setMediaMessage("No Media API");
@@ -413,6 +490,10 @@ function renderMediaBox(): void {
     return;
   }
   if (mediaLoadState === "loaded") {
+    if (selectedMedia) {
+      renderSelectedMediaPlaceholder();
+      return;
+    }
     renderMediaList();
     return;
   }
@@ -421,6 +502,7 @@ function renderMediaBox(): void {
 
 function setActiveMediaTab(nextTab: MediaTab): void {
   activeMediaTab = nextTab;
+  selectedMedia = null;
   setTabButtonState();
   renderMediaBox();
 }
@@ -428,6 +510,7 @@ function setActiveMediaTab(nextTab: MediaTab): void {
 function installUiHandlers(): void {
   const videosButton = document.getElementById("tab-videos") as HTMLButtonElement | null;
   const imagesButton = document.getElementById("tab-images") as HTMLButtonElement | null;
+  const searchInput = document.getElementById("media-search") as HTMLInputElement | null;
   if (videosButton) {
     videosButton.addEventListener("click", () => {
       setActiveMediaTab("videos");
@@ -436,6 +519,12 @@ function installUiHandlers(): void {
   if (imagesButton) {
     imagesButton.addEventListener("click", () => {
       setActiveMediaTab("images");
+    });
+  }
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      mediaSearchQuery = searchInput.value;
+      renderMediaBox();
     });
   }
 }
