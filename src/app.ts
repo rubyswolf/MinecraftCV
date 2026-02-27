@@ -122,20 +122,6 @@ type LaunchSelectionIntent = {
   fRaw: string;
 };
 
-type SelectionRectClient = {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-};
-
-type SelectionRectPixels = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
 declare global {
   interface Window {
     MCV_API?: McvClientApi;
@@ -159,13 +145,6 @@ let viewerVideoNode: HTMLVideoElement | null = null;
 let viewerHmsInput: HTMLInputElement | null = null;
 let viewerEditingField: "hms" | null = null;
 let launchSelectionIntent: LaunchSelectionIntent | null = null;
-let imageSelectionStartPoint: { x: number; y: number } | null = null;
-let imageSelectionCurrentPoint: { x: number; y: number } | null = null;
-let isImageSelectionDragging = false;
-let activeSelectionRectClient: SelectionRectClient | null = null;
-let activeSelectionRectPixels: SelectionRectPixels | null = null;
-let selectionPipelineTokenCounter = 0;
-let activeSelectionPipelineToken = 0;
 let cropResultCache:
   | {
       colorDataUrl: string;
@@ -176,6 +155,23 @@ let cropResultCache:
 let manualLineSegments: McvLineSegment[] = [];
 let manualDraftLineSegment: McvLineSegment | null = null;
 let manualDragPointerId: number | null = null;
+let manualDragClientX = 0;
+let manualDragClientY = 0;
+let viewerCtrlHeld = false;
+let viewerMotionRafId: number | null = null;
+const viewerMotion = {
+  x: 0,
+  y: 0,
+  velX: 0,
+  velY: 0,
+  zoom: 1,
+};
+const viewerInput = {
+  grabbed: false,
+  pointerId: null as number | null,
+  x: 0,
+  y: 0,
+};
 let mediaLibrary: MediaLibrary = {
   videos: {},
   images: {},
@@ -185,11 +181,25 @@ const NO_YOUTUBE_VIDEO_ERROR =
   "video is not provided by the Media API, please download the video yourself and upload it.";
 const NO_MEDIA_ID_ERROR = "media ID is not provided by the Media API.";
 const VIEWER_FPS = 30;
+// const movement = {speed: 1.0,friction: 1.0,grip: 1.0,stop: 1.0,slip: 0.0,buildup: 0,zoomSpeed: 0.001} //sharp
+// const movement = {speed: 1.0,friction: 0.05,grip: 1.0,stop: 1.0,slip: 0.0,buildup: 0,zoomSpeed: 0.001} //smooth
+const movement = {
+  speed: 1.0,
+  friction: 0.05,
+  grip: 0.2,
+  stop: 0.0,
+  slip: 1.0,
+  buildup: 0.1,
+  zoomSpeed: 0.001,
+}; //buttery
+// const movement = {speed: 1.0,friction: 0.05,grip: 0.2,stop: 0.0,slip: 1.0,buildup: 0.5,zoomSpeed: 0.001} //gliding
 
 function resetCropInteractionState(): void {
   manualLineSegments = [];
   manualDraftLineSegment = null;
   manualDragPointerId = null;
+  manualDragClientX = 0;
+  manualDragClientY = 0;
 }
 
 function isThenable(value: unknown): value is Promise<unknown> {
@@ -569,12 +579,16 @@ function getViewerFullImageNode(): HTMLImageElement | null {
   return document.getElementById("viewer-full-image") as HTMLImageElement | null;
 }
 
-function getViewerSelectionBoxNode(): HTMLDivElement | null {
-  return document.getElementById("viewer-selection-box") as HTMLDivElement | null;
-}
-
 function getViewerCropResultNode(): HTMLDivElement | null {
   return document.getElementById("viewer-crop-result") as HTMLDivElement | null;
+}
+
+function getViewerCropResultSvgNode(): SVGSVGElement | null {
+  const cropResultNode = getViewerCropResultNode();
+  if (!cropResultNode) {
+    return null;
+  }
+  return cropResultNode.firstElementChild as SVGSVGElement | null;
 }
 
 function hideViewerCropResult(): void {
@@ -593,165 +607,82 @@ function showViewerCropResult(): void {
   cropResultNode.classList.remove("hidden");
 }
 
-function setViewerSelectionBoxState(state: "default" | "cropping"): void {
-  const selectionBox = getViewerSelectionBoxNode();
-  if (!selectionBox) {
+function updateViewerCursor(): void {
+  const cropResultNode = getViewerCropResultNode();
+  if (!cropResultNode) {
     return;
   }
-  selectionBox.classList.toggle("is-cropping", state === "cropping");
-}
-
-function hideViewerSelectionBox(): void {
-  const selectionBox = getViewerSelectionBoxNode();
-  if (!selectionBox) {
+  if (viewerInput.grabbed) {
+    cropResultNode.style.cursor = "grabbing";
     return;
   }
-  setViewerSelectionBoxState("default");
-  selectionBox.classList.add("hidden");
+  cropResultNode.style.cursor = viewerCtrlHeld ? "move" : "crosshair";
 }
 
-function clampPointToImageBounds(clientX: number, clientY: number): { x: number; y: number } | null {
-  const image = getViewerFullImageNode();
-  if (!image) {
-    return null;
+function engageViewerGrab(pointerId: number): void {
+  viewerInput.grabbed = true;
+  viewerInput.pointerId = pointerId;
+  viewerInput.x = manualDragClientX;
+  viewerInput.y = manualDragClientY;
+  viewerMotion.velX *= 1 - movement.stop;
+  viewerMotion.velY *= 1 - movement.stop;
+  updateViewerCursor();
+}
+
+function releaseViewerGrab(): void {
+  viewerInput.grabbed = false;
+  viewerInput.pointerId = null;
+  updateViewerCursor();
+}
+
+function resetViewerMotionState(): void {
+  viewerMotion.x = 0;
+  viewerMotion.y = 0;
+  viewerMotion.velX = 0;
+  viewerMotion.velY = 0;
+  viewerMotion.zoom = 1;
+  viewerInput.grabbed = false;
+  viewerInput.pointerId = null;
+}
+
+function applyViewerTransformToSvg(): void {
+  const svg = getViewerCropResultSvgNode();
+  if (!svg) {
+    return;
   }
-  const rect = image.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) {
-    return null;
+  const group = svg.querySelector('[data-role="viewer-scene"]') as SVGGElement | null;
+  if (!group) {
+    return;
   }
-  return {
-    x: Math.min(rect.right, Math.max(rect.left, clientX)),
-    y: Math.min(rect.bottom, Math.max(rect.top, clientY)),
+  group.setAttribute(
+    "transform",
+    `translate(${viewerMotion.x} ${viewerMotion.y}) scale(${viewerMotion.zoom})`
+  );
+}
+
+function stopViewerMotionLoop(): void {
+  if (viewerMotionRafId !== null) {
+    cancelAnimationFrame(viewerMotionRafId);
+    viewerMotionRafId = null;
+  }
+}
+
+function startViewerMotionLoop(): void {
+  if (viewerMotionRafId !== null) {
+    return;
+  }
+  const tick = () => {
+    const factor = (viewerInput.grabbed ? movement.slip : 1) * movement.speed;
+    viewerMotion.x += viewerMotion.velX * factor;
+    viewerMotion.y += viewerMotion.velY * factor;
+
+    const decay = viewerInput.grabbed ? 1 - movement.grip : 1 - movement.friction;
+    viewerMotion.velX *= decay;
+    viewerMotion.velY *= decay;
+    applyViewerTransformToSvg();
+    viewerMotionRafId = requestAnimationFrame(tick);
   };
-}
-
-function createSelectionRectFromPoints(
-  startClient: { x: number; y: number },
-  currentClient: { x: number; y: number }
-): SelectionRectClient | null {
-  const stage = getViewerFullImageStageNode();
-  const clampedStart = clampPointToImageBounds(startClient.x, startClient.y);
-  const clampedCurrent = clampPointToImageBounds(currentClient.x, currentClient.y);
-  if (!stage || !clampedStart || !clampedCurrent) {
-    return null;
-  }
-  const stageRect = stage.getBoundingClientRect();
-  const left = Math.min(clampedStart.x, clampedCurrent.x) - stageRect.left;
-  const top = Math.min(clampedStart.y, clampedCurrent.y) - stageRect.top;
-  const width = Math.abs(clampedCurrent.x - clampedStart.x);
-  const height = Math.abs(clampedCurrent.y - clampedStart.y);
-  return { left, top, width, height };
-}
-
-function applySelectionRect(rect: SelectionRectClient): void {
-  const stage = getViewerFullImageStageNode();
-  const selectionBox = getViewerSelectionBoxNode();
-  if (!stage || !selectionBox) {
-    hideViewerSelectionBox();
-    return;
-  }
-  selectionBox.style.left = `${rect.left}px`;
-  selectionBox.style.top = `${rect.top}px`;
-  selectionBox.style.width = `${rect.width}px`;
-  selectionBox.style.height = `${rect.height}px`;
-  selectionBox.classList.remove("hidden");
-}
-
-function updateViewerSelectionBox(
-  startClient: { x: number; y: number },
-  currentClient: { x: number; y: number }
-): SelectionRectClient | null {
-  const rect = createSelectionRectFromPoints(startClient, currentClient);
-  if (!rect) {
-    hideViewerSelectionBox();
-    return null;
-  }
-  applySelectionRect(rect);
-  return rect;
-}
-
-function createSelectionPixelsFromRect(rect: SelectionRectClient): SelectionRectPixels | null {
-  const image = getViewerFullImageNode();
-  if (!image) {
-    return null;
-  }
-  const imageRect = image.getBoundingClientRect();
-  const naturalWidth = image.naturalWidth || image.width;
-  const naturalHeight = image.naturalHeight || image.height;
-  if (imageRect.width <= 0 || imageRect.height <= 0 || naturalWidth <= 0 || naturalHeight <= 0) {
-    return null;
-  }
-
-  const stage = getViewerFullImageStageNode();
-  if (!stage) {
-    return null;
-  }
-  const stageRect = stage.getBoundingClientRect();
-  const rectClientLeft = stageRect.left + rect.left;
-  const rectClientTop = stageRect.top + rect.top;
-  const rectClientRight = rectClientLeft + rect.width;
-  const rectClientBottom = rectClientTop + rect.height;
-
-  const clampedLeft = Math.max(imageRect.left, Math.min(imageRect.right, rectClientLeft));
-  const clampedTop = Math.max(imageRect.top, Math.min(imageRect.bottom, rectClientTop));
-  const clampedRight = Math.max(imageRect.left, Math.min(imageRect.right, rectClientRight));
-  const clampedBottom = Math.max(imageRect.top, Math.min(imageRect.bottom, rectClientBottom));
-
-  const widthClient = Math.max(1, clampedRight - clampedLeft);
-  const heightClient = Math.max(1, clampedBottom - clampedTop);
-
-  const x = Math.max(
-    0,
-    Math.min(naturalWidth - 1, Math.round(((clampedLeft - imageRect.left) / imageRect.width) * naturalWidth))
-  );
-  const y = Math.max(
-    0,
-    Math.min(naturalHeight - 1, Math.round(((clampedTop - imageRect.top) / imageRect.height) * naturalHeight))
-  );
-  const width = Math.max(1, Math.min(naturalWidth - x, Math.round((widthClient / imageRect.width) * naturalWidth)));
-  const height = Math.max(
-    1,
-    Math.min(naturalHeight - y, Math.round((heightClient / imageRect.height) * naturalHeight))
-  );
-
-  if (width < 2 || height < 2) {
-    return null;
-  }
-  return { x, y, width, height };
-}
-
-function createCropDataUrlFromPixels(rectPixels: SelectionRectPixels): string {
-  const image = getViewerFullImageNode();
-  if (!image) {
-    throw new Error("No image selected");
-  }
-  const cropCanvas = document.createElement("canvas");
-  cropCanvas.width = rectPixels.width;
-  cropCanvas.height = rectPixels.height;
-  const ctx = cropCanvas.getContext("2d");
-  if (!ctx) {
-    throw new Error("Canvas context unavailable");
-  }
-  ctx.drawImage(
-    image,
-    rectPixels.x,
-    rectPixels.y,
-    rectPixels.width,
-    rectPixels.height,
-    0,
-    0,
-    rectPixels.width,
-    rectPixels.height
-  );
-  return cropCanvas.toDataURL("image/png");
-}
-
-function showFullImageLayer(): void {
-  const image = getViewerFullImageNode();
-  if (image) {
-    image.classList.remove("hidden");
-  }
-  hideViewerCropResult();
+  viewerMotionRafId = requestAnimationFrame(tick);
 }
 
 function clearViewerFullImage(): void {
@@ -766,16 +697,11 @@ function clearViewerFullImage(): void {
   if (stage) {
     stage.classList.add("hidden");
   }
-  imageSelectionStartPoint = null;
-  imageSelectionCurrentPoint = null;
-  isImageSelectionDragging = false;
-  activeSelectionRectClient = null;
-  activeSelectionRectPixels = null;
-  activeSelectionPipelineToken = ++selectionPipelineTokenCounter;
+  resetViewerMotionState();
+  stopViewerMotionLoop();
   cropResultCache = null;
   resetCropInteractionState();
   hideViewerCropResult();
-  hideViewerSelectionBox();
 }
 
 function scrollViewerFullImageIntoView(): void {
@@ -796,18 +722,28 @@ function showViewerFullImage(src: string, alt: string): void {
   if (!stage || !image) {
     return;
   }
-  activeSelectionRectClient = null;
-  activeSelectionRectPixels = null;
-  activeSelectionPipelineToken = ++selectionPipelineTokenCounter;
+  resetViewerMotionState();
   cropResultCache = null;
   resetCropInteractionState();
-  hideViewerSelectionBox();
   hideViewerCropResult();
   image.crossOrigin = "anonymous";
   image.classList.remove("hidden");
   image.src = src;
   image.alt = alt;
   image.onload = () => {
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    if (width > 0 && height > 0) {
+      cropResultCache = {
+        colorDataUrl: src,
+        width,
+        height,
+      };
+      renderCropResultFromCache();
+      image.classList.add("hidden");
+      startViewerMotionLoop();
+      updateViewerCursor();
+    }
     scrollViewerFullImageIntoView();
   };
   stage.classList.remove("hidden");
@@ -831,7 +767,10 @@ function createCropResultSvgBase(width: number, height: number, imageDataUrl: st
   imageNode.setAttribute("width", String(width));
   imageNode.setAttribute("height", String(height));
   imageNode.setAttribute("preserveAspectRatio", "none");
-  svg.appendChild(imageNode);
+  const sceneGroup = document.createElementNS(svgNs, "g");
+  sceneGroup.setAttribute("data-role", "viewer-scene");
+  sceneGroup.appendChild(imageNode);
+  svg.appendChild(sceneGroup);
   return svg;
 }
 
@@ -869,6 +808,29 @@ function appendSvgIntersectionDot(parent: SVGElement, x: number, y: number): voi
   parent.appendChild(circle);
 }
 
+function getCropViewPointFromClient(
+  clientX: number,
+  clientY: number,
+  width: number,
+  height: number
+): { x: number; y: number } | null {
+  const cropResultNode = getViewerCropResultNode();
+  const displayNode = cropResultNode?.firstElementChild as
+    | (Element & { getBoundingClientRect: () => DOMRect })
+    | null;
+  if (!displayNode) {
+    return null;
+  }
+  const rect = displayNode.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+  return {
+    x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) * width,
+    y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)) * height,
+  };
+}
+
 function getLineIntersection(
   first: McvLineSegment,
   second: McvLineSegment
@@ -901,20 +863,14 @@ function getCropPointFromClient(
   width: number,
   height: number
 ): { x: number; y: number } | null {
-  const cropResultNode = getViewerCropResultNode();
-  const displayNode = cropResultNode?.firstElementChild as
-    | (Element & { getBoundingClientRect: () => DOMRect })
-    | null;
-  if (!displayNode) {
+  const viewPoint = getCropViewPointFromClient(clientX, clientY, width, height);
+  if (!viewPoint) {
     return null;
   }
-  const rect = displayNode.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) {
-    return null;
-  }
-  const x = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) * width;
-  const y = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)) * height;
-  return { x, y };
+  return {
+    x: (viewPoint.x - viewerMotion.x) / viewerMotion.zoom,
+    y: (viewPoint.y - viewerMotion.y) / viewerMotion.zoom,
+  };
 }
 
 function createManualModeCropResultSvg(
@@ -923,16 +879,20 @@ function createManualModeCropResultSvg(
   colorDataUrl: string
 ): SVGSVGElement {
   const svg = createCropResultSvgBase(width, height, colorDataUrl);
+  const sceneGroup = svg.querySelector('[data-role="viewer-scene"]') as SVGGElement | null;
+  if (!sceneGroup) {
+    return svg;
+  }
 
   if (manualLineSegments[0]) {
-    appendSvgLine(svg, manualLineSegments[0], "#ff4d4d", 2, 1);
+    appendSvgLine(sceneGroup, manualLineSegments[0], "#ff4d4d", 2, 1);
   }
   if (manualLineSegments[1]) {
-    appendSvgLine(svg, manualLineSegments[1], "#5dff74", 2, 1);
+    appendSvgLine(sceneGroup, manualLineSegments[1], "#5dff74", 2, 1);
   }
   if (manualDraftLineSegment) {
     const draftColor = manualLineSegments.length === 0 ? "#ff4d4d" : "#5dff74";
-    appendSvgLine(svg, manualDraftLineSegment, draftColor, 2, 0.9);
+    appendSvgLine(sceneGroup, manualDraftLineSegment, draftColor, 2, 0.9);
   }
 
   const first = manualLineSegments[0];
@@ -940,7 +900,7 @@ function createManualModeCropResultSvg(
   if (first && second) {
     const intersection = getLineIntersection(first, second);
     if (intersection) {
-      appendSvgIntersectionDot(svg, intersection.x, intersection.y);
+      appendSvgIntersectionDot(sceneGroup, intersection.x, intersection.y);
     }
   }
 
@@ -948,12 +908,15 @@ function createManualModeCropResultSvg(
     if (event.button !== 0 || !cropResultCache) {
       return;
     }
-    const point = getCropPointFromClient(
-      event.clientX,
-      event.clientY,
-      cropResultCache.width,
-      cropResultCache.height
-    );
+    if (event.ctrlKey || viewerCtrlHeld) {
+      manualDragClientX = event.clientX;
+      manualDragClientY = event.clientY;
+      engageViewerGrab(event.pointerId);
+      event.preventDefault();
+      return;
+    }
+
+    const point = getCropPointFromClient(event.clientX, event.clientY, cropResultCache.width, cropResultCache.height);
     if (!point) {
       return;
     }
@@ -962,9 +925,39 @@ function createManualModeCropResultSvg(
     }
     manualDraftLineSegment = [point.x, point.y, point.x, point.y];
     manualDragPointerId = event.pointerId;
+    manualDragClientX = event.clientX;
+    manualDragClientY = event.clientY;
     event.preventDefault();
     renderCropResultFromCache();
   });
+
+  svg.addEventListener("wheel", (event) => {
+    if (!cropResultCache || !(event.ctrlKey || viewerCtrlHeld)) {
+      return;
+    }
+    const viewPoint = getCropViewPointFromClient(
+      event.clientX,
+      event.clientY,
+      cropResultCache.width,
+      cropResultCache.height
+    );
+    if (!viewPoint) {
+      return;
+    }
+    event.preventDefault();
+
+    const zoomFactor = (1 + movement.zoomSpeed) ** -event.deltaY;
+    const nextZoom = viewerMotion.zoom * zoomFactor;
+    const imageX = (viewPoint.x - viewerMotion.x) / viewerMotion.zoom;
+    const imageY = (viewPoint.y - viewerMotion.y) / viewerMotion.zoom;
+    viewerMotion.x = viewPoint.x - imageX * nextZoom;
+    viewerMotion.y = viewPoint.y - imageY * nextZoom;
+    viewerMotion.zoom = nextZoom;
+    applyViewerTransformToSvg();
+  });
+
+  applyViewerTransformToSvg();
+  updateViewerCursor();
 
   return svg;
 }
@@ -1005,6 +998,34 @@ function renderCropResultFromCache(): void {
 
 function updateManualDraftFromPointer(pointer: PointerEvent): void {
   if (
+    viewerInput.grabbed &&
+    viewerInput.pointerId !== null &&
+    pointer.pointerId === viewerInput.pointerId
+  ) {
+    manualDragClientX = pointer.clientX;
+    manualDragClientY = pointer.clientY;
+    const dxClient = pointer.clientX - viewerInput.x;
+    const dyClient = pointer.clientY - viewerInput.y;
+    viewerInput.x = pointer.clientX;
+    viewerInput.y = pointer.clientY;
+    if (cropResultCache) {
+      const svg = getViewerCropResultSvgNode();
+      const rect = svg?.getBoundingClientRect();
+      if (rect && rect.width > 0 && rect.height > 0) {
+        const dx = dxClient * (cropResultCache.width / rect.width);
+        const dy = dyClient * (cropResultCache.height / rect.height);
+        const factor = movement.speed * (1 - movement.slip);
+        viewerMotion.x += dx * factor;
+        viewerMotion.y += dy * factor;
+        viewerMotion.velX = dx + viewerMotion.velX * movement.buildup;
+        viewerMotion.velY = dy + viewerMotion.velY * movement.buildup;
+        applyViewerTransformToSvg();
+      }
+    }
+    return;
+  }
+
+  if (
     !cropResultCache ||
     manualDragPointerId === null ||
     pointer.pointerId !== manualDragPointerId ||
@@ -1012,6 +1033,8 @@ function updateManualDraftFromPointer(pointer: PointerEvent): void {
   ) {
     return;
   }
+  manualDragClientX = pointer.clientX;
+  manualDragClientY = pointer.clientY;
   const point = getCropPointFromClient(
     pointer.clientX,
     pointer.clientY,
@@ -1031,6 +1054,19 @@ function updateManualDraftFromPointer(pointer: PointerEvent): void {
 }
 
 function finalizeManualDraftFromPointer(pointer: PointerEvent): void {
+  if (
+    viewerInput.grabbed &&
+    viewerInput.pointerId !== null &&
+    pointer.pointerId === viewerInput.pointerId
+  ) {
+    manualDragClientX = pointer.clientX;
+    manualDragClientY = pointer.clientY;
+    releaseViewerGrab();
+    if (manualDragPointerId === null || pointer.pointerId !== manualDragPointerId) {
+      return;
+    }
+  }
+
   if (
     !cropResultCache ||
     manualDragPointerId === null ||
@@ -1064,39 +1100,6 @@ function finalizeManualDraftFromPointer(pointer: PointerEvent): void {
     }
   }
   renderCropResultFromCache();
-}
-
-function startSelectionPipelineFromActiveRect(): void {
-  if (!activeSelectionRectPixels) {
-    return;
-  }
-  let cropDataUrl = "";
-  try {
-    cropDataUrl = createCropDataUrlFromPixels(activeSelectionRectPixels);
-  } catch (error) {
-    setMediaError(`Failed to crop selection: ${String(error)}`);
-    return;
-  }
-
-  clearMediaError();
-  setViewerSelectionBoxState("cropping");
-  showFullImageLayer();
-  cropResultCache = null;
-  resetCropInteractionState();
-
-  activeSelectionPipelineToken = ++selectionPipelineTokenCounter;
-  cropResultCache = {
-    colorDataUrl: cropDataUrl,
-    width: activeSelectionRectPixels.width,
-    height: activeSelectionRectPixels.height,
-  };
-  renderCropResultFromCache();
-  const image = getViewerFullImageNode();
-  if (image) {
-    image.classList.add("hidden");
-  }
-  hideViewerSelectionBox();
-  scrollViewerFullImageIntoView();
 }
 
 function setMediaError(message: string): void {
@@ -2187,13 +2190,12 @@ function setActiveMediaTab(nextTab: MediaTab): void {
 }
 
 function restoreFullUncroppedImageView(): void {
-  activeSelectionRectClient = null;
-  activeSelectionRectPixels = null;
-  activeSelectionPipelineToken = ++selectionPipelineTokenCounter;
-  cropResultCache = null;
+  if (!cropResultCache) {
+    return;
+  }
   resetCropInteractionState();
-  hideViewerSelectionBox();
-  showFullImageLayer();
+  resetViewerMotionState();
+  renderCropResultFromCache();
   clearMediaError();
 }
 
@@ -2320,7 +2322,6 @@ function installUiHandlers(): void {
   const viewerBackButton = document.getElementById("viewer-back") as HTMLButtonElement | null;
   const searchInput = document.getElementById("media-search") as HTMLInputElement | null;
   const fileInput = document.getElementById("upload-file-input") as HTMLInputElement | null;
-  const viewerFullImage = getViewerFullImageNode();
   if (videosButton) {
     videosButton.addEventListener("click", () => {
       setActiveMediaTab("videos");
@@ -2343,6 +2344,37 @@ function installUiHandlers(): void {
     });
   }
   document.addEventListener("keydown", handleViewerKeybind);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Control") {
+      viewerCtrlHeld = true;
+      if (
+        manualDragPointerId !== null &&
+        !viewerInput.grabbed &&
+        manualDraftLineSegment
+      ) {
+        engageViewerGrab(manualDragPointerId);
+      }
+      updateViewerCursor();
+    }
+  });
+  document.addEventListener("keyup", (event) => {
+    if (event.key === "Control") {
+      viewerCtrlHeld = false;
+      if (
+        viewerInput.grabbed &&
+        manualDragPointerId !== null &&
+        viewerInput.pointerId === manualDragPointerId
+      ) {
+        releaseViewerGrab();
+      }
+      updateViewerCursor();
+    }
+  });
+  window.addEventListener("blur", () => {
+    viewerCtrlHeld = false;
+    releaseViewerGrab();
+    updateViewerCursor();
+  });
   document.addEventListener("pointermove", (event) => {
     updateManualDraftFromPointer(event);
   });
@@ -2382,66 +2414,6 @@ function installUiHandlers(): void {
         });
         fileInput.value = "";
       }
-    });
-  }
-
-  if (viewerFullImage) {
-    viewerFullImage.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) {
-        return;
-      }
-      if (viewerFullImage.classList.contains("hidden")) {
-        return;
-      }
-      const start = clampPointToImageBounds(event.clientX, event.clientY);
-      if (!start) {
-        return;
-      }
-      imageSelectionStartPoint = start;
-      imageSelectionCurrentPoint = start;
-      isImageSelectionDragging = true;
-      const rect = updateViewerSelectionBox(start, start);
-      if (rect) {
-        setViewerSelectionBoxState("default");
-      }
-      viewerFullImage.setPointerCapture(event.pointerId);
-      event.preventDefault();
-    });
-    viewerFullImage.addEventListener("pointermove", (event) => {
-      if (!isImageSelectionDragging || !imageSelectionStartPoint) {
-        return;
-      }
-      imageSelectionCurrentPoint = { x: event.clientX, y: event.clientY };
-      updateViewerSelectionBox(imageSelectionStartPoint, imageSelectionCurrentPoint);
-      event.preventDefault();
-    });
-    const finishSelection = () => {
-      if (isImageSelectionDragging && imageSelectionStartPoint && imageSelectionCurrentPoint) {
-        const rect = createSelectionRectFromPoints(imageSelectionStartPoint, imageSelectionCurrentPoint);
-        if (rect && rect.width >= 2 && rect.height >= 2) {
-          const pixelRect = createSelectionPixelsFromRect(rect);
-          if (pixelRect) {
-            activeSelectionRectClient = rect;
-            activeSelectionRectPixels = pixelRect;
-            applySelectionRect(rect);
-            setViewerSelectionBoxState("cropping");
-            startSelectionPipelineFromActiveRect();
-          } else {
-            hideViewerSelectionBox();
-          }
-        } else {
-          hideViewerSelectionBox();
-        }
-      }
-      isImageSelectionDragging = false;
-      imageSelectionStartPoint = null;
-      imageSelectionCurrentPoint = null;
-    };
-    viewerFullImage.addEventListener("pointerup", () => {
-      finishSelection();
-    });
-    viewerFullImage.addEventListener("pointercancel", () => {
-      finishSelection();
     });
   }
 }

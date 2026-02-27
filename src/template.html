@@ -234,7 +234,7 @@ __MCV_BODY_STYLE__
       margin-right: 0;
       margin-top: 12px;
       display: block;
-      overflow-x: hidden;
+      overflow: hidden;
       position: relative;
     }
     .viewer-full-image-stage.hidden {
@@ -251,23 +251,11 @@ __MCV_BODY_STYLE__
       object-fit: contain;
       margin: 0 auto;
     }
-    .viewer-selection-box {
-      position: absolute;
-      border: 2px solid var(--accent);
-      background: transparent;
-      pointer-events: none;
-      z-index: 2;
-    }
-    .viewer-selection-box.hidden {
-      display: none;
-    }
-    .viewer-selection-box.is-cropping {
-      border-color: #65d6a6;
-    }
     .viewer-crop-result {
       width: 100%;
       display: grid;
       place-items: center;
+      cursor: crosshair;
     }
     .viewer-crop-result.hidden {
       display: none;
@@ -280,6 +268,7 @@ __MCV_BODY_STYLE__
       height: auto;
       margin: 0 auto;
       background: transparent;
+      touch-action: none;
     }
     .time-controls {
       display: grid;
@@ -364,7 +353,6 @@ __MCV_BODY_STYLE__
   </main>
   <section id="viewer-full-image-stage" class="viewer-full-image-stage hidden">
     <img id="viewer-full-image" class="viewer-full-image" alt="" />
-    <div id="viewer-selection-box" class="viewer-selection-box hidden"></div>
     <div id="viewer-crop-result" class="viewer-crop-result hidden"></div>
   </section>
 __BACKEND_SCRIPTS__
