@@ -1005,6 +1005,78 @@ function openViewerInYoutube(): void {
   window.open(ytUrl, "_blank", "noopener,noreferrer");
 }
 
+function getAnalyzedFrameTitle(): string {
+  const { seconds, frame } = getCurrentViewerTimeParts();
+  const sourceTitle = viewerMedia?.title ? ` from ${viewerMedia.title}` : "";
+  return `Frame${sourceTitle} @ ${formatTimestamp(seconds)}|${frame}`;
+}
+
+async function captureViewerFrameObjectUrl(): Promise<string> {
+  if (!viewerVideoNode) {
+    throw new Error("No active video");
+  }
+  const width = Math.floor(viewerVideoNode.videoWidth);
+  const height = Math.floor(viewerVideoNode.videoHeight);
+  if (width <= 0 || height <= 0) {
+    throw new Error("Video metadata is not ready yet");
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("Canvas context unavailable");
+  }
+  context.drawImage(viewerVideoNode, 0, 0, width, height);
+
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((nextBlob) => {
+      if (!nextBlob) {
+        reject(new Error("Failed to encode frame"));
+        return;
+      }
+      resolve(nextBlob);
+    }, "image/png");
+  });
+  return URL.createObjectURL(blob);
+}
+
+async function analyzeViewerFrame(analyzeButton: HTMLButtonElement | null): Promise<void> {
+  const originalLabel = analyzeButton?.textContent || "Analyze!";
+  const setLabel = (label: string) => {
+    if (analyzeButton) {
+      analyzeButton.textContent = label;
+    }
+  };
+  const resetLabelSoon = () => {
+    window.setTimeout(() => {
+      setLabel(originalLabel);
+    }, 1600);
+  };
+
+  setLabel("Analyzing...");
+  try {
+    const frameObjectUrl = await captureViewerFrameObjectUrl();
+    openViewer({
+      tab: "upload",
+      id: "analyzed-frame",
+      kind: "image",
+      title: getAnalyzedFrameTitle(),
+      url: frameObjectUrl,
+      isObjectUrl: true,
+    });
+  } catch (error) {
+    const name = (error as { name?: string } | null)?.name || "";
+    if (name === "SecurityError") {
+      setLabel("CORS blocked");
+    } else {
+      setLabel("Analyze failed");
+    }
+    resetLabelSoon();
+  }
+}
+
 function closeViewer(): void {
   viewerMedia = null;
   viewerVideoNode = null;
@@ -1032,6 +1104,7 @@ function renderViewerScreen(): void {
   if (viewerMedia.kind === "image") {
     const imageNode = document.createElement("img");
     imageNode.className = "viewer-image";
+    imageNode.crossOrigin = "anonymous";
     imageNode.src = viewerMedia.url;
     imageNode.alt = viewerMedia.title;
     contentNode.appendChild(imageNode);
@@ -1043,6 +1116,7 @@ function renderViewerScreen(): void {
   videoNode.className = "viewer-video";
   videoNode.controls = true;
   videoNode.preload = "metadata";
+  videoNode.crossOrigin = "anonymous";
   videoNode.src = viewerMedia.url;
   contentNode.appendChild(videoNode);
 
@@ -1086,6 +1160,9 @@ function renderViewerScreen(): void {
   analyzeButton.type = "button";
   analyzeButton.className = "viewer-action-button accent";
   analyzeButton.textContent = "Analyze!";
+  analyzeButton.addEventListener("click", () => {
+    void analyzeViewerFrame(analyzeButton);
+  });
   hmsInputRow.appendChild(analyzeButton);
 
   hmsRow.appendChild(hmsLabel);
