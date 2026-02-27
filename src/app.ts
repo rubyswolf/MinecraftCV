@@ -166,6 +166,16 @@ let activeSelectionRectClient: SelectionRectClient | null = null;
 let activeSelectionRectPixels: SelectionRectPixels | null = null;
 let selectionPipelineTokenCounter = 0;
 let activeSelectionPipelineToken = 0;
+let cropManualMode = false;
+let cropResultCache:
+  | {
+      colorDataUrl: string;
+      grayDataUrl: string;
+      lineSegments: McvLineSegment[];
+      width: number;
+      height: number;
+    }
+  | null = null;
 let mediaLibrary: MediaLibrary = {
   videos: {},
   images: {},
@@ -756,6 +766,8 @@ function clearViewerFullImage(): void {
   activeSelectionRectClient = null;
   activeSelectionRectPixels = null;
   activeSelectionPipelineToken = ++selectionPipelineTokenCounter;
+  cropManualMode = false;
+  cropResultCache = null;
   hideViewerCropResult();
   hideViewerSelectionBox();
 }
@@ -781,6 +793,8 @@ function showViewerFullImage(src: string, alt: string): void {
   activeSelectionRectClient = null;
   activeSelectionRectPixels = null;
   activeSelectionPipelineToken = ++selectionPipelineTokenCounter;
+  cropManualMode = false;
+  cropResultCache = null;
   hideViewerSelectionBox();
   hideViewerCropResult();
   image.crossOrigin = "anonymous";
@@ -819,7 +833,7 @@ function createCropResultSvg(
   svg.appendChild(imageNode);
 
   const group = document.createElementNS(svgNs, "g");
-  group.setAttribute("stroke", "#ffffff");
+  group.setAttribute("stroke", "var(--accent)");
   group.setAttribute("stroke-width", "1");
   group.setAttribute("stroke-linecap", "round");
   group.setAttribute("vector-effect", "non-scaling-stroke");
@@ -835,31 +849,48 @@ function createCropResultSvg(
   return svg;
 }
 
-function sizeCropResultSvg(svg: SVGSVGElement, width: number, height: number): void {
+function sizeCropResultElement(
+  element: Element & { style: CSSStyleDeclaration },
+  width: number,
+  height: number
+): void {
   const stage = getViewerFullImageStageNode();
   const stageRect = stage?.getBoundingClientRect();
   const availableWidth = Math.max(120, window.innerWidth - 24);
   const viewportTop = stageRect ? Math.max(0, stageRect.top) : 0;
   const availableHeight = Math.max(120, window.innerHeight - viewportTop - 12);
   const scale = Math.max(0.01, Math.min(availableWidth / width, availableHeight / height));
-  svg.style.width = `${Math.floor(width * scale)}px`;
-  svg.style.height = `${Math.floor(height * scale)}px`;
+  element.style.width = `${Math.floor(width * scale)}px`;
+  element.style.height = `${Math.floor(height * scale)}px`;
 }
 
-async function renderCropResultWithLineOverlay(
-  grayDataUrl: string,
-  lineSegments: McvLineSegment[],
-  width: number,
-  height: number
-): Promise<void> {
+function renderCropResultFromCache(): void {
+  if (!cropResultCache) {
+    return;
+  }
   const cropResultNode = getViewerCropResultNode();
   if (!cropResultNode) {
     return;
   }
 
-  const svg = createCropResultSvg(width, height, grayDataUrl, lineSegments);
-  sizeCropResultSvg(svg, width, height);
-  cropResultNode.replaceChildren(svg);
+  if (cropManualMode) {
+    const image = document.createElement("img");
+    image.className = "viewer-crop-result-svg";
+    image.src = cropResultCache.colorDataUrl;
+    image.alt = "Manual crop";
+    image.style.objectFit = "contain";
+    sizeCropResultElement(image, cropResultCache.width, cropResultCache.height);
+    cropResultNode.replaceChildren(image);
+  } else {
+    const svg = createCropResultSvg(
+      cropResultCache.width,
+      cropResultCache.height,
+      cropResultCache.grayDataUrl,
+      cropResultCache.lineSegments
+    );
+    sizeCropResultElement(svg, cropResultCache.width, cropResultCache.height);
+    cropResultNode.replaceChildren(svg);
+  }
   showViewerCropResult();
 }
 
@@ -878,6 +909,8 @@ function startSelectionPipelineFromActiveRect(): void {
   clearMediaError();
   setViewerSelectionBoxState("cropping");
   showFullImageLayer();
+  cropManualMode = false;
+  cropResultCache = null;
 
   const token = ++selectionPipelineTokenCounter;
   activeSelectionPipelineToken = token;
@@ -890,12 +923,14 @@ function startSelectionPipelineFromActiveRect(): void {
       if (token !== activeSelectionPipelineToken) {
         return;
       }
-      await renderCropResultWithLineOverlay(
-        result.grayscale_image_data_url,
-        result.line_segments,
-        result.width,
-        result.height
-      );
+      cropResultCache = {
+        colorDataUrl: cropDataUrl,
+        grayDataUrl: result.grayscale_image_data_url,
+        lineSegments: result.line_segments,
+        width: result.width,
+        height: result.height,
+      };
+      renderCropResultFromCache();
       const image = getViewerFullImageNode();
       if (image) {
         image.classList.add("hidden");
@@ -1999,7 +2034,28 @@ function setActiveMediaTab(nextTab: MediaTab): void {
   renderMediaBox();
 }
 
+function restoreFullUncroppedImageView(): void {
+  activeSelectionRectClient = null;
+  activeSelectionRectPixels = null;
+  activeSelectionPipelineToken = ++selectionPipelineTokenCounter;
+  cropManualMode = false;
+  cropResultCache = null;
+  hideViewerSelectionBox();
+  showFullImageLayer();
+  clearMediaError();
+}
+
 function handleViewerKeybind(event: KeyboardEvent): void {
+  if (event.key === "Escape") {
+    const fullImage = getViewerFullImageNode();
+    const hasCropView = !!cropResultCache || !!(fullImage && fullImage.classList.contains("hidden"));
+    if (hasCropView) {
+      event.preventDefault();
+      restoreFullUncroppedImageView();
+    }
+    return;
+  }
+
   if (!viewerVideoNode || !viewerMedia || viewerMedia.kind !== "video") {
     return;
   }
@@ -2113,6 +2169,7 @@ function installUiHandlers(): void {
   const searchInput = document.getElementById("media-search") as HTMLInputElement | null;
   const fileInput = document.getElementById("upload-file-input") as HTMLInputElement | null;
   const viewerFullImage = getViewerFullImageNode();
+  const viewerStage = getViewerFullImageStageNode();
   if (videosButton) {
     videosButton.addEventListener("click", () => {
       setActiveMediaTab("videos");
@@ -2225,6 +2282,16 @@ function installUiHandlers(): void {
     });
     viewerFullImage.addEventListener("pointercancel", () => {
       finishSelection();
+    });
+  }
+  if (viewerStage) {
+    viewerStage.addEventListener("contextmenu", (event) => {
+      if (!cropResultCache) {
+        return;
+      }
+      event.preventDefault();
+      cropManualMode = !cropManualMode;
+      renderCropResultFromCache();
     });
   }
 }
