@@ -35,7 +35,7 @@ export default function MCV(props: MCVProps) {
       className={className}
       style={{ width: "100%", minHeight: 480, border: 0, ...style }}
       srcDoc={MCV_HTML}
-      sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups allow-popups-to-escape-sandbox"
     />
   );
 }

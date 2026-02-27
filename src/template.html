@@ -37,50 +37,78 @@ __MCV_BODY_STYLE__
       margin: 0 0 14px;
       color: var(--muted);
     }
-    .controls {
+    .tabs {
       display: flex;
       gap: 10px;
       margin-bottom: 14px;
     }
-    button {
-      background: var(--accent);
-      color: #082014;
-      border: 0;
+    .tab-button {
+      background: #111821;
+      color: var(--text);
+      border: 1px solid var(--border);
       border-radius: 8px;
       font-weight: 650;
       padding: 9px 14px;
       cursor: pointer;
+      transition: background 120ms ease;
     }
-    button:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
+    .tab-button.active {
+      background: var(--accent);
+      color: #082014;
+      border-color: transparent;
     }
-    .status {
-      margin-bottom: 10px;
-      color: var(--muted);
-      min-height: 1.2em;
-    }
-    pre {
+    .media-box {
       margin: 0;
       padding: 12px;
       border: 1px solid var(--border);
       border-radius: 8px;
       background: #0f151c;
       overflow: auto;
-      min-height: 180px;
+      min-height: 300px;
       color: #d7e7fb;
+    }
+    .media-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 10px;
+    }
+    .media-item {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      background: #141d27;
+    }
+    .media-title {
+      font-weight: 650;
+      margin-bottom: 6px;
+      word-break: break-word;
+    }
+    .media-meta {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 6px;
+      word-break: break-word;
+    }
+    .media-link {
+      color: #9fd4ff;
+      text-decoration: none;
+      word-break: break-all;
+    }
+    .media-link:hover {
+      text-decoration: underline;
     }
   </style>
 </head>
 <body>
   <main class="card">
-    <h1>MinecraftCV (Placeholder)</h1>
-    <p>Click the button to run a simple OpenCV test and validate backend wiring.</p>
-    <div class="controls">
-      <button id="test-button" type="button">Run OpenCV Test</button>
+    <h1>MinecraftCV</h1>
+    <div class="tabs">
+      <button id="tab-videos" class="tab-button active" type="button">Videos</button>
+      <button id="tab-images" class="tab-button" type="button">Images</button>
     </div>
-    <div id="status" class="status">Waiting for backend health check...</div>
-    <pre id="output">No results yet.</pre>
+    <div id="media-box" class="media-box">loading...</div>
   </main>
 __BACKEND_SCRIPTS__
   <script>

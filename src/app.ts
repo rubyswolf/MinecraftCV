@@ -48,6 +48,25 @@ type McvClientApi = {
   };
 };
 
+type MediaTab = "videos" | "images";
+type MediaLoadState = "loading" | "no_api" | "fetching" | "failed" | "loaded";
+
+type MediaVideoEntry = {
+  name: string;
+  url: string;
+  youtube_id?: string;
+};
+
+type MediaImageEntry = {
+  name: string;
+  url: string;
+};
+
+type MediaLibrary = {
+  videos: Record<string, MediaVideoEntry>;
+  images: Record<string, MediaImageEntry>;
+};
+
 declare global {
   interface Window {
     MCV_API?: McvClientApi;
@@ -60,6 +79,12 @@ declare const __MCV_MEDIA_API_URL__: string;
 declare const __MCV_DATA_API_URL__: string;
 
 let cvPromise: Promise<unknown> | null = null;
+let activeMediaTab: MediaTab = "videos";
+let mediaLoadState: MediaLoadState = "loading";
+let mediaLibrary: MediaLibrary = {
+  videos: {},
+  images: {},
+};
 
 function isThenable(value: unknown): value is Promise<unknown> {
   return typeof value === "object" && value !== null && "then" in value;
@@ -229,94 +254,226 @@ function installGlobalApi(): void {
   };
 }
 
-function setStatus(message: string): void {
-  const statusNode = document.getElementById("status");
-  if (statusNode) {
-    statusNode.textContent = message;
-  }
+function getMediaBoxNode(): HTMLDivElement | null {
+  return document.getElementById("media-box") as HTMLDivElement | null;
 }
 
-function setOutput(message: string): void {
-  const outputNode = document.getElementById("output");
-  if (outputNode) {
-    outputNode.textContent = message;
+function setMediaMessage(message: string): void {
+  const mediaBoxNode = getMediaBoxNode();
+  if (!mediaBoxNode) {
+    return;
   }
+  mediaBoxNode.textContent = message;
 }
 
-async function checkHealth(): Promise<void> {
-  const mediaStatus = isMediaApiAvailable() ? __MCV_MEDIA_API_URL__ : "disabled";
-  const dataStatus = isDataApiAvailable() ? __MCV_DATA_API_URL__ : "disabled";
-
-  if (__MCV_BACKEND__ === "web") {
-    try {
-      const cv = await getWebMcvRuntime();
-      setStatus(
-        `Connected to web backend (opencv.js ${String((cv as any).VERSION ?? "ready")}, media API: ${mediaStatus}, data API: ${dataStatus})`
-      );
-      return;
-    } catch (error) {
-      setStatus(`Web backend init failed: ${String(error)}`);
-      return;
-    }
-  }
-
-  try {
-    const response = await fetch("/api/mcv/health");
-    if (!response.ok) {
-      setStatus(`Backend health check failed: HTTP ${response.status}`);
-      return;
-    }
-    const payload = (await response.json()) as { ok: boolean; backend?: string };
-    if (!payload.ok) {
-      setStatus("Backend health check failed");
-      return;
-    }
-    setStatus(
-      `Connected to backend (${payload.backend ?? "unknown"}, media API: ${mediaStatus}, data API: ${dataStatus})`
-    );
-  } catch {
-    setStatus("Could not connect to backend");
-  }
+function configureExternalLink(node: HTMLAnchorElement, url: string, label: string): void {
+  node.className = "media-link";
+  node.href = url;
+  node.target = "_blank";
+  node.rel = "noopener noreferrer";
+  node.textContent = label;
+  node.addEventListener("click", (event) => {
+    event.preventDefault();
+    window.open(url, "_blank", "noopener,noreferrer");
+  });
 }
 
-async function handleTestButtonClick(): Promise<void> {
-  const button = document.getElementById("test-button") as HTMLButtonElement | null;
-  if (!button) {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeVideos(value: unknown): Record<string, MediaVideoEntry> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const output: Record<string, MediaVideoEntry> = {};
+  for (const [id, entry] of Object.entries(value)) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const name = typeof entry.name === "string" ? entry.name.trim() : "";
+    const url = typeof entry.url === "string" ? entry.url.trim() : "";
+    if (!name || !url) {
+      continue;
+    }
+    const youtubeId =
+      typeof entry.youtube_id === "string" && entry.youtube_id.trim()
+        ? entry.youtube_id.trim()
+        : undefined;
+    output[id] = {
+      name,
+      url,
+      ...(youtubeId ? { youtube_id: youtubeId } : {}),
+    };
+  }
+  return output;
+}
+
+function normalizeImages(value: unknown): Record<string, MediaImageEntry> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const output: Record<string, MediaImageEntry> = {};
+  for (const [id, entry] of Object.entries(value)) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const name = typeof entry.name === "string" ? entry.name.trim() : "";
+    const url = typeof entry.url === "string" ? entry.url.trim() : "";
+    if (!name || !url) {
+      continue;
+    }
+    output[id] = { name, url };
+  }
+  return output;
+}
+
+function parseMediaLibrary(payload: unknown): MediaLibrary | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+  return {
+    videos: normalizeVideos(payload.videos),
+    images: normalizeImages(payload.images),
+  };
+}
+
+function setTabButtonState(): void {
+  const videosButton = document.getElementById("tab-videos") as HTMLButtonElement | null;
+  const imagesButton = document.getElementById("tab-images") as HTMLButtonElement | null;
+  if (!videosButton || !imagesButton) {
+    return;
+  }
+  const isVideos = activeMediaTab === "videos";
+  videosButton.classList.toggle("active", isVideos);
+  imagesButton.classList.toggle("active", !isVideos);
+}
+
+function renderMediaList(): void {
+  const mediaBoxNode = getMediaBoxNode();
+  if (!mediaBoxNode) {
+    return;
+  }
+  const mediaEntries =
+    activeMediaTab === "videos"
+      ? Object.entries(mediaLibrary.videos)
+      : Object.entries(mediaLibrary.images);
+
+  if (mediaEntries.length === 0) {
+    setMediaMessage(activeMediaTab === "videos" ? "No videos found." : "No images found.");
     return;
   }
 
-  button.disabled = true;
-  setStatus("Running OpenCV test...");
+  const listNode = document.createElement("ul");
+  listNode.className = "media-list";
 
-  const result = await callMcvApi<McvOpencvTestResult>({
-    op: "cv.opencvTest",
-    args: {},
-  });
+  for (const [id, item] of mediaEntries) {
+    const listItemNode = document.createElement("li");
+    listItemNode.className = "media-item";
 
-  if (result.ok) {
-    setStatus(`OpenCV call succeeded (version ${result.data.opencv_version})`);
-    setOutput(JSON.stringify(result.data, null, 2));
-  } else {
-    setStatus(`OpenCV call failed: ${result.error.code}`);
-    setOutput(JSON.stringify(result.error, null, 2));
+    const titleNode = document.createElement("div");
+    titleNode.className = "media-title";
+    titleNode.textContent = item.name;
+
+    const metaNode = document.createElement("div");
+    metaNode.className = "media-meta";
+    metaNode.textContent = id;
+    if (activeMediaTab === "videos" && "youtube_id" in item && item.youtube_id) {
+      const separatorNode = document.createTextNode(" • YouTube: ");
+      const youtubeLinkNode = document.createElement("a");
+      const youtubeUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(item.youtube_id)}`;
+      configureExternalLink(youtubeLinkNode, youtubeUrl, item.youtube_id);
+      metaNode.appendChild(separatorNode);
+      metaNode.appendChild(youtubeLinkNode);
+    }
+
+    const urlNode = document.createElement("a");
+    configureExternalLink(urlNode, item.url, item.url);
+
+    listItemNode.appendChild(titleNode);
+    listItemNode.appendChild(metaNode);
+    listItemNode.appendChild(urlNode);
+    listNode.appendChild(listItemNode);
   }
 
-  button.disabled = false;
+  mediaBoxNode.replaceChildren(listNode);
+}
+
+function renderMediaBox(): void {
+  if (mediaLoadState === "no_api") {
+    setMediaMessage("No Media API");
+    return;
+  }
+  if (mediaLoadState === "fetching") {
+    setMediaMessage("Fetching...");
+    return;
+  }
+  if (mediaLoadState === "failed") {
+    setMediaMessage("Failed to fetch Media Library");
+    return;
+  }
+  if (mediaLoadState === "loaded") {
+    renderMediaList();
+    return;
+  }
+  setMediaMessage("loading...");
+}
+
+function setActiveMediaTab(nextTab: MediaTab): void {
+  activeMediaTab = nextTab;
+  setTabButtonState();
+  renderMediaBox();
 }
 
 function installUiHandlers(): void {
-  const button = document.getElementById("test-button");
-  if (button) {
-    button.addEventListener("click", () => {
-      void handleTestButtonClick();
+  const videosButton = document.getElementById("tab-videos") as HTMLButtonElement | null;
+  const imagesButton = document.getElementById("tab-images") as HTMLButtonElement | null;
+  if (videosButton) {
+    videosButton.addEventListener("click", () => {
+      setActiveMediaTab("videos");
     });
+  }
+  if (imagesButton) {
+    imagesButton.addEventListener("click", () => {
+      setActiveMediaTab("images");
+    });
+  }
+}
+
+async function loadMediaLibrary(): Promise<void> {
+  if (!isMediaApiAvailable()) {
+    mediaLoadState = "no_api";
+    renderMediaBox();
+    return;
+  }
+
+  mediaLoadState = "fetching";
+  renderMediaBox();
+
+  try {
+    const response = await fetchMediaApi();
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const parsed = parseMediaLibrary(await response.json());
+    if (!parsed) {
+      throw new Error("Invalid media schema");
+    }
+    mediaLibrary = parsed;
+    mediaLoadState = "loaded";
+    renderMediaBox();
+  } catch {
+    mediaLoadState = "failed";
+    renderMediaBox();
   }
 }
 
 function bootstrap(): void {
   installGlobalApi();
   installUiHandlers();
-  void checkHealth();
+  setTabButtonState();
+  renderMediaBox();
+  void loadMediaLibrary();
 }
 
 if (document.readyState === "loading") {
