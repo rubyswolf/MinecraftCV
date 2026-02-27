@@ -113,10 +113,13 @@ let mediaSearchQuery = "";
 let selectedUploadFilename = "";
 let viewerMedia: ViewerMedia | null = null;
 let currentViewerObjectUrl: string | null = null;
+let currentAnalyzedImageObjectUrl: string | null = null;
 let viewerVideoNode: HTMLVideoElement | null = null;
 let viewerHmsInput: HTMLInputElement | null = null;
 let viewerEditingField: "hms" | null = null;
 let launchSelectionIntent: LaunchSelectionIntent | null = null;
+let imageSelectionStartPoint: { x: number; y: number } | null = null;
+let isImageSelectionDragging = false;
 let mediaLibrary: MediaLibrary = {
   videos: {},
   images: {},
@@ -319,6 +322,109 @@ function getViewerContentNode(): HTMLDivElement | null {
   return document.getElementById("viewer-content") as HTMLDivElement | null;
 }
 
+function getViewerFullImageStageNode(): HTMLElement | null {
+  return document.getElementById("viewer-full-image-stage");
+}
+
+function getViewerFullImageNode(): HTMLImageElement | null {
+  return document.getElementById("viewer-full-image") as HTMLImageElement | null;
+}
+
+function getViewerSelectionBoxNode(): HTMLDivElement | null {
+  return document.getElementById("viewer-selection-box") as HTMLDivElement | null;
+}
+
+function hideViewerSelectionBox(): void {
+  const selectionBox = getViewerSelectionBoxNode();
+  if (!selectionBox) {
+    return;
+  }
+  selectionBox.classList.add("hidden");
+}
+
+function clampPointToImageBounds(clientX: number, clientY: number): { x: number; y: number } | null {
+  const image = getViewerFullImageNode();
+  if (!image) {
+    return null;
+  }
+  const rect = image.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+  return {
+    x: Math.min(rect.right, Math.max(rect.left, clientX)),
+    y: Math.min(rect.bottom, Math.max(rect.top, clientY)),
+  };
+}
+
+function updateViewerSelectionBox(startClient: { x: number; y: number }, currentClient: { x: number; y: number }): void {
+  const stage = getViewerFullImageStageNode();
+  const selectionBox = getViewerSelectionBoxNode();
+  const clampedStart = clampPointToImageBounds(startClient.x, startClient.y);
+  const clampedCurrent = clampPointToImageBounds(currentClient.x, currentClient.y);
+  if (!stage || !selectionBox || !clampedStart || !clampedCurrent) {
+    hideViewerSelectionBox();
+    return;
+  }
+
+  const stageRect = stage.getBoundingClientRect();
+  const left = Math.min(clampedStart.x, clampedCurrent.x) - stageRect.left;
+  const top = Math.min(clampedStart.y, clampedCurrent.y) - stageRect.top;
+  const width = Math.abs(clampedCurrent.x - clampedStart.x);
+  const height = Math.abs(clampedCurrent.y - clampedStart.y);
+
+  selectionBox.style.left = `${left}px`;
+  selectionBox.style.top = `${top}px`;
+  selectionBox.style.width = `${width}px`;
+  selectionBox.style.height = `${height}px`;
+  selectionBox.classList.remove("hidden");
+}
+
+function clearViewerFullImage(): void {
+  const stage = getViewerFullImageStageNode();
+  const image = getViewerFullImageNode();
+  if (image) {
+    image.onload = null;
+    image.removeAttribute("src");
+    image.alt = "";
+  }
+  if (stage) {
+    stage.classList.add("hidden");
+  }
+  imageSelectionStartPoint = null;
+  isImageSelectionDragging = false;
+  hideViewerSelectionBox();
+}
+
+function scrollViewerFullImageIntoView(): void {
+  const stage = getViewerFullImageStageNode();
+  if (!stage) {
+    return;
+  }
+  const top = window.scrollY + stage.getBoundingClientRect().top - 8;
+  window.scrollTo({
+    top: Math.max(0, top),
+    behavior: "smooth",
+  });
+}
+
+function showViewerFullImage(src: string, alt: string): void {
+  const stage = getViewerFullImageStageNode();
+  const image = getViewerFullImageNode();
+  if (!stage || !image) {
+    return;
+  }
+  image.crossOrigin = "anonymous";
+  image.src = src;
+  image.alt = alt;
+  image.onload = () => {
+    scrollViewerFullImageIntoView();
+  };
+  stage.classList.remove("hidden");
+  requestAnimationFrame(scrollViewerFullImageIntoView);
+  window.setTimeout(scrollViewerFullImageIntoView, 60);
+}
+
 function setMediaError(message: string): void {
   const errorNode = getMediaErrorNode();
   if (!errorNode) {
@@ -343,6 +449,13 @@ function revokeViewerObjectUrl(): void {
   if (currentViewerObjectUrl) {
     URL.revokeObjectURL(currentViewerObjectUrl);
     currentViewerObjectUrl = null;
+  }
+}
+
+function revokeAnalyzedImageObjectUrl(): void {
+  if (currentAnalyzedImageObjectUrl) {
+    URL.revokeObjectURL(currentAnalyzedImageObjectUrl);
+    currentAnalyzedImageObjectUrl = null;
   }
 }
 
@@ -1055,17 +1168,13 @@ async function analyzeViewerFrame(analyzeButton: HTMLButtonElement | null): Prom
     }, 1600);
   };
 
-  setLabel("Analyzing...");
+  setLabel("Extracting...");
   try {
     const frameObjectUrl = await captureViewerFrameObjectUrl();
-    openViewer({
-      tab: "upload",
-      id: "analyzed-frame",
-      kind: "image",
-      title: getAnalyzedFrameTitle(),
-      url: frameObjectUrl,
-      isObjectUrl: true,
-    });
+    revokeAnalyzedImageObjectUrl();
+    currentAnalyzedImageObjectUrl = frameObjectUrl;
+    showViewerFullImage(frameObjectUrl, getAnalyzedFrameTitle());
+    setLabel("Analyze!");
   } catch (error) {
     const name = (error as { name?: string } | null)?.name || "";
     if (name === "SecurityError") {
@@ -1082,6 +1191,8 @@ function closeViewer(): void {
   viewerVideoNode = null;
   viewerHmsInput = null;
   viewerEditingField = null;
+  clearViewerFullImage();
+  revokeAnalyzedImageObjectUrl();
   revokeViewerObjectUrl();
   setViewerMode(false);
 }
@@ -1102,15 +1213,13 @@ function renderViewerScreen(): void {
   contentNode.replaceChildren();
 
   if (viewerMedia.kind === "image") {
-    const imageNode = document.createElement("img");
-    imageNode.className = "viewer-image";
-    imageNode.crossOrigin = "anonymous";
-    imageNode.src = viewerMedia.url;
-    imageNode.alt = viewerMedia.title;
-    contentNode.appendChild(imageNode);
+    clearMediaError();
+    showViewerFullImage(viewerMedia.url, viewerMedia.title);
     setViewerMode(true);
     return;
   }
+
+  clearViewerFullImage();
 
   const videoNode = document.createElement("video");
   videoNode.className = "viewer-video";
@@ -1228,6 +1337,7 @@ function renderViewerScreen(): void {
 }
 
 function openViewer(nextViewer: ViewerMedia): void {
+  revokeAnalyzedImageObjectUrl();
   if (nextViewer.isObjectUrl) {
     revokeViewerObjectUrl();
     currentViewerObjectUrl = nextViewer.url;
@@ -1515,6 +1625,7 @@ function installUiHandlers(): void {
   const viewerBackButton = document.getElementById("viewer-back") as HTMLButtonElement | null;
   const searchInput = document.getElementById("media-search") as HTMLInputElement | null;
   const fileInput = document.getElementById("upload-file-input") as HTMLInputElement | null;
+  const viewerFullImage = getViewerFullImageNode();
   if (videosButton) {
     videosButton.addEventListener("click", () => {
       setActiveMediaTab("videos");
@@ -1567,6 +1678,41 @@ function installUiHandlers(): void {
         });
         fileInput.value = "";
       }
+    });
+  }
+
+  if (viewerFullImage) {
+    viewerFullImage.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+      const start = clampPointToImageBounds(event.clientX, event.clientY);
+      if (!start) {
+        return;
+      }
+      imageSelectionStartPoint = start;
+      isImageSelectionDragging = true;
+      updateViewerSelectionBox(start, start);
+      viewerFullImage.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    viewerFullImage.addEventListener("pointermove", (event) => {
+      if (!isImageSelectionDragging || !imageSelectionStartPoint) {
+        return;
+      }
+      updateViewerSelectionBox(imageSelectionStartPoint, { x: event.clientX, y: event.clientY });
+      event.preventDefault();
+    });
+    const finishSelection = () => {
+      isImageSelectionDragging = false;
+      imageSelectionStartPoint = null;
+      hideViewerSelectionBox();
+    };
+    viewerFullImage.addEventListener("pointerup", () => {
+      finishSelection();
+    });
+    viewerFullImage.addEventListener("pointercancel", () => {
+      finishSelection();
     });
   }
 }
