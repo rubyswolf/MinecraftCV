@@ -274,6 +274,8 @@ let viewerVideoNode: HTMLVideoElement | null = null;
 let viewerHmsInput: HTMLInputElement | null = null;
 let viewerEditingField: "hms" | null = null;
 let viewerActiveVideoContext: ViewerMedia | null = null;
+let viewerDetectedFps: number | null = null;
+let stopViewerFpsProbe: (() => void) | null = null;
 let pendingImportedMcvState:
   | {
       annotations: ManualAnnotation[];
@@ -351,7 +353,7 @@ let mediaLibrary: MediaLibrary = {
 const NO_YOUTUBE_VIDEO_ERROR =
   "video is not provided by the Media API, please download the video yourself and upload it.";
 const NO_MEDIA_ID_ERROR = "media ID is not provided by the Media API.";
-const VIEWER_FPS = 30;
+const VIEWER_FPS_FALLBACK = 30;
 // const movement = {speed: 1.0,friction: 1.0,grip: 1.0,stop: 1.0,slip: 0.0,buildup: 0,zoomSpeed: 0.001} //sharp
 // const movement = {speed: 1.0,friction: 0.05,grip: 1.0,stop: 1.0,slip: 0.0,buildup: 0,zoomSpeed: 0.001} //smooth
 const movement = {
@@ -364,6 +366,109 @@ const movement = {
   zoomSpeed: 0.001,
 }; //buttery
 // const movement = {speed: 1.0,friction: 0.05,grip: 0.2,stop: 0.0,slip: 1.0,buildup: 0.5,zoomSpeed: 0.001} //gliding
+
+function getViewerFrameRate(): number {
+  if (typeof viewerDetectedFps === "number" && Number.isFinite(viewerDetectedFps) && viewerDetectedFps > 0) {
+    return viewerDetectedFps;
+  }
+  return VIEWER_FPS_FALLBACK;
+}
+
+function getViewerFrameDurationSeconds(): number {
+  const fps = getViewerFrameRate();
+  return fps > 0 ? 1 / fps : 1 / VIEWER_FPS_FALLBACK;
+}
+
+function getViewerFrameBase(): number {
+  const base = Math.round(getViewerFrameRate());
+  return Math.max(1, Number.isFinite(base) ? base : VIEWER_FPS_FALLBACK);
+}
+
+function stopViewerFrameRateProbe(): void {
+  if (stopViewerFpsProbe) {
+    stopViewerFpsProbe();
+    stopViewerFpsProbe = null;
+  }
+  viewerDetectedFps = null;
+}
+
+function startViewerFrameRateProbe(video: HTMLVideoElement): void {
+  stopViewerFrameRateProbe();
+  const callbackFn = (video as HTMLVideoElement & {
+    requestVideoFrameCallback?: (
+      callback: (now: number, metadata: { mediaTime?: number; presentedFrames?: number }) => void
+    ) => number;
+    cancelVideoFrameCallback?: (handle: number) => void;
+  }).requestVideoFrameCallback;
+  if (typeof callbackFn !== "function") {
+    return;
+  }
+  const cancelFn = (video as HTMLVideoElement & {
+    cancelVideoFrameCallback?: (handle: number) => void;
+  }).cancelVideoFrameCallback;
+  let canceled = false;
+  let handle: number | null = null;
+  let lastMediaTime: number | null = null;
+  let lastPresentedFrames: number | null = null;
+  const samples: number[] = [];
+  const maxSamples = 48;
+
+  const computeMedian = (values: number[]): number => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    if (sorted.length % 2 === 0) {
+      return (sorted[middle - 1] + sorted[middle]) * 0.5;
+    }
+    return sorted[middle];
+  };
+
+  const schedule = () => {
+    if (canceled) {
+      return;
+    }
+    handle = callbackFn.call(video, (_now, metadata) => {
+      if (canceled) {
+        return;
+      }
+      const mediaTime = typeof metadata.mediaTime === "number" ? metadata.mediaTime : null;
+      const presentedFrames =
+        typeof metadata.presentedFrames === "number" ? metadata.presentedFrames : null;
+      if (mediaTime !== null) {
+        if (lastMediaTime !== null && mediaTime > lastMediaTime) {
+          let frameDelta = 1;
+          if (
+            presentedFrames !== null &&
+            lastPresentedFrames !== null &&
+            presentedFrames > lastPresentedFrames
+          ) {
+            frameDelta = presentedFrames - lastPresentedFrames;
+          }
+          const fpsSample = frameDelta / (mediaTime - lastMediaTime);
+          if (Number.isFinite(fpsSample) && fpsSample > 1 && fpsSample < 240) {
+            samples.push(fpsSample);
+            if (samples.length > maxSamples) {
+              samples.shift();
+            }
+            viewerDetectedFps = computeMedian(samples);
+          }
+        }
+        lastMediaTime = mediaTime;
+      }
+      if (presentedFrames !== null) {
+        lastPresentedFrames = presentedFrames;
+      }
+      schedule();
+    });
+  };
+
+  schedule();
+  stopViewerFpsProbe = () => {
+    canceled = true;
+    if (handle !== null && typeof cancelFn === "function") {
+      cancelFn.call(video, handle);
+    }
+  };
+}
 
 function getAnnotationLength(annotation: ManualAnnotation): number {
   return Math.hypot(annotation.to.x - annotation.from.x, annotation.to.y - annotation.from.y);
@@ -2089,6 +2194,7 @@ function clearViewerFullImage(): void {
   resetCropInteractionState();
   hideViewerCropResult();
   removePoseSolvePanel();
+  stopViewerFrameRateProbe();
 }
 
 function scrollViewerFullImageIntoView(): void {
@@ -4209,7 +4315,8 @@ function splitSecondsAndFrames(secondsValue: number): { seconds: number; frames:
   const safe = Math.max(0, Number.isFinite(secondsValue) ? secondsValue : 0);
   const seconds = Math.floor(safe);
   const fractional = safe - seconds;
-  const frames = Math.max(0, Math.min(VIEWER_FPS - 1, Math.floor(fractional * VIEWER_FPS + 1e-6)));
+  const frameBase = getViewerFrameBase();
+  const frames = Math.max(0, Math.min(frameBase - 1, Math.floor(fractional * frameBase + 1e-6)));
   return { seconds, frames };
 }
 
@@ -4377,9 +4484,10 @@ function buildLaunchSeekInfo(intent: LaunchSelectionIntent): {
     frame = Math.max(0, Number(intent.fRaw));
   }
 
-  const initialSeekSeconds = Math.max(0, parsedT) + frame / VIEWER_FPS;
-  const displayFrame = frame % VIEWER_FPS;
-  const displaySeconds = Math.max(0, Math.floor(parsedT + Math.floor(frame / VIEWER_FPS)));
+  const frameBase = getViewerFrameBase();
+  const initialSeekSeconds = Math.max(0, parsedT) + frame / frameBase;
+  const displayFrame = frame % frameBase;
+  const displaySeconds = Math.max(0, Math.floor(parsedT + Math.floor(frame / frameBase)));
   const timestampLabel = `${formatTimestamp(displaySeconds)}|${displayFrame}`;
   return { initialSeekSeconds, timestampLabel };
 }
@@ -5105,7 +5213,8 @@ function syncViewerTimeInputs(force = false): void {
   const safe = Math.max(0, current);
   const wholeSeconds = Math.floor(safe);
   const fractional = safe - wholeSeconds;
-  const frame = Math.min(VIEWER_FPS - 1, Math.floor(fractional * VIEWER_FPS));
+  const frameBase = getViewerFrameBase();
+  const frame = Math.min(frameBase - 1, Math.floor(fractional * frameBase));
   viewerHmsInput.value = `${formatTimestamp(wholeSeconds)}|${frame}`;
 }
 
@@ -5146,8 +5255,9 @@ function seekViewerFromInput(): void {
   if (baseSeconds === null) {
     return;
   }
-  const normalizedFrame = Math.min(parsedWithFrame.frame, VIEWER_FPS - 1);
-  const targetSeconds = Math.max(0, baseSeconds) + normalizedFrame / VIEWER_FPS;
+  const frameBase = getViewerFrameBase();
+  const normalizedFrame = Math.min(parsedWithFrame.frame, frameBase - 1);
+  const targetSeconds = Math.max(0, baseSeconds) + normalizedFrame / frameBase;
   viewerVideoNode.currentTime = clampVideoTime(viewerVideoNode, targetSeconds);
 }
 
@@ -5158,7 +5268,8 @@ function getCurrentViewerTimeParts(): { seconds: number; frame: number } {
   const safeTime = Math.max(0, Number.isFinite(viewerVideoNode.currentTime) ? viewerVideoNode.currentTime : 0);
   const wholeSeconds = Math.floor(safeTime);
   const fractional = safeTime - wholeSeconds;
-  const frame = Math.max(0, Math.min(VIEWER_FPS - 1, Math.floor(fractional * VIEWER_FPS + 1e-6)));
+  const frameBase = getViewerFrameBase();
+  const frame = Math.max(0, Math.min(frameBase - 1, Math.floor(fractional * frameBase + 1e-6)));
   return { seconds: wholeSeconds, frame };
 }
 
@@ -5380,6 +5491,8 @@ function renderVideoViewerUi(
   viewerVideoNode = videoNode;
   viewerHmsInput = hmsInput;
   viewerEditingField = null;
+  viewerDetectedFps = null;
+  startViewerFrameRateProbe(videoNode);
 
   const commitAndSync = () => {
     seekViewerFromInput();
@@ -5432,6 +5545,19 @@ function renderVideoViewerUi(
     syncViewerTimeInputs(true);
   });
 
+  videoNode.addEventListener("ratechange", () => {
+    syncViewerTimeInputs(true);
+  });
+
+  videoNode.addEventListener("emptied", () => {
+    viewerDetectedFps = null;
+    syncViewerTimeInputs(true);
+  });
+
+  videoNode.addEventListener("loadeddata", () => {
+    syncViewerTimeInputs(true);
+  });
+
   syncViewerTimeInputs(true);
   contentNode.appendChild(panel);
   refreshUnsavedActionUi();
@@ -5455,7 +5581,8 @@ function mountImportedSourceVideoForCurrentImage(source: McvDataSource, attempt 
     return;
   }
   if (source.seconds !== undefined || source.frames !== undefined) {
-    linkedVideo.initialSeekSeconds = Math.max(0, source.seconds ?? 0) + Math.max(0, source.frames ?? 0) / VIEWER_FPS;
+    linkedVideo.initialSeekSeconds =
+      Math.max(0, source.seconds ?? 0) + Math.max(0, source.frames ?? 0) / getViewerFrameBase();
     linkedVideo.timestampLabel = `${formatTimestamp(Math.max(0, source.seconds ?? 0))}|${Math.max(0, source.frames ?? 0)}`;
   }
   renderVideoViewerUi(viewerContent, linkedVideo, {
@@ -5551,6 +5678,7 @@ function closeViewer(): void {
   viewerActiveVideoContext = null;
   activeAnalyzeButton = null;
   pendingImportedVideoSourceForImageLoad = null;
+  stopViewerFrameRateProbe();
   clearViewerFullImage();
   revokeAnalyzedImageObjectUrl();
   revokeViewerObjectUrl();
@@ -6037,9 +6165,9 @@ function handleViewerKeybind(event: KeyboardEvent): void {
 
   let deltaSeconds = 0;
   if (event.key === ",") {
-    deltaSeconds = -1 / VIEWER_FPS;
+    deltaSeconds = -getViewerFrameDurationSeconds();
   } else if (event.key === ".") {
-    deltaSeconds = 1 / VIEWER_FPS;
+    deltaSeconds = getViewerFrameDurationSeconds();
   } else if (event.key === "ArrowLeft") {
     deltaSeconds = -5;
   } else if (event.key === "ArrowRight") {

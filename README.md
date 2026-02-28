@@ -1,6 +1,6 @@
 # What does MCV do?
 
-Minecraft Computer Vision (MCV) is a tool for recreating Minecraft player poses from images and video. It lets you label points on a Minecraft world image ~~with edge-detection assistance~~ by drawing lines, pair those points with in-game world coordinates, and then solve the PnL problem (estimating camera pose and focal length from 2D-3D correspondences). This tool was created to assist in collecting evidence for the Dream MCC 11 Parkour cheating controversy, but it can be used for many other applications. For those reasons, it is open source and free for anyone to use.
+Minecraft Computer Vision (MCV) is a tool for recreating Minecraft player poses from images and video. It lets you label points on a Minecraft world image ~~with edge-detection assistance~~ by drawing lines, pair those points with in-game world coordinates, and then solve the PnL problem (estimating camera pose and focal length from 2D-3D correspondences). This tool was created to assist in collecting evidence for the Dream MCC 11 Parkour cheating controversy, but it can be used for many other applications. For those reasons, it is open source and free for anyone to use. Learn how to use it by reading `Controls.md`.
 
 # Where does it run?
 
@@ -86,6 +86,7 @@ Media API behavior:
 - If either API path is omitted, that API is disabled by default.
 
 Media API schema docs are in `APIs.md`.
+Data API is not yet implemented, project is being left here. You can however import (upload) and export (control+s) data to SVG files which contain the image, JSON data in a script tag and the different collected bits of data as vector graphics layers.
 
 ## Build OpenCV.js
 
@@ -118,9 +119,10 @@ Whitelist used for exported JS bindings:
 
 - `build/opencv_js_mcv_whitelist.py`
 
-# Coming soon
+~~# Coming soon~~
 
-I plan to host a version of the tool on my website, https://dartjs.com, specifically for collecting evidence for the Dream controversy so we can crowdsource data collection and publish the data publicly for anyone to analyze. I also plan to analyze the data myself, publish the results, and share them with YouTubers to present the evidence in an easy-to-understand way.
+~~I plan to host a version of the tool on my website, https://dartjs.com, specifically for collecting evidence for the Dream controversy so we can crowdsource data collection and publish the data publicly for anyone to analyze. I also plan to analyze the data myself, publish the results, and share them with YouTubers to present the evidence in an easy-to-understand way.~~
 
-Let's find out whether or not he cheated together!
+~~Let's find out whether or not he cheated together!~~
 
+The highest quality I got from a controlled custom example was 0.0312 blocks or about half a minecraft pixel, which is pretty good! However, the actual footage is heavily compressed and since a lot of the parkour is in enclosed spaces with few features, the accuracy is likely to be worse. This is not enough to determine which jumps were and weren't on the final tick so for the intened application the project has failed. However, the tool is still useful for general pose estimation for any voxel based game/system and map recreation.
