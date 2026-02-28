@@ -35,6 +35,18 @@ type McvImagePipelineArgs = {
 };
 
 type McvLineSegment = [number, number, number, number];
+type ManualAxis = "x" | "y" | "z";
+type DirectedManualLine = {
+  segment: McvLineSegment;
+  axis: ManualAxis;
+  edgeLength: number;
+};
+type DraftManualLine = {
+  segment: McvLineSegment;
+  axis: ManualAxis;
+  flipped: boolean;
+  edgeLength: number;
+};
 
 type McvImagePipelineResult = {
   grayscale_image_data_url: string;
@@ -152,8 +164,11 @@ let cropResultCache:
       height: number;
     }
   | null = null;
-let manualLineSegments: McvLineSegment[] = [];
-let manualDraftLineSegment: McvLineSegment | null = null;
+let manualAxisSelection: ManualAxis = "x";
+let manualAxisStartsBackwards = false;
+let manualLines: DirectedManualLine[] = [];
+let manualRedoLines: DirectedManualLine[] = [];
+let manualDraftLine: DraftManualLine | null = null;
 let manualDragPointerId: number | null = null;
 let manualDragClientX = 0;
 let manualDragClientY = 0;
@@ -195,11 +210,13 @@ const movement = {
 // const movement = {speed: 1.0,friction: 0.05,grip: 0.2,stop: 0.0,slip: 1.0,buildup: 0.5,zoomSpeed: 0.001} //gliding
 
 function resetCropInteractionState(): void {
-  manualLineSegments = [];
-  manualDraftLineSegment = null;
+  manualLines = [];
+  manualRedoLines = [];
+  manualDraftLine = null;
   manualDragPointerId = null;
   manualDragClientX = 0;
   manualDragClientY = 0;
+  manualAxisStartsBackwards = false;
 }
 
 function isThenable(value: unknown): value is Promise<unknown> {
@@ -779,7 +796,8 @@ function appendSvgLine(
   segment: McvLineSegment,
   stroke: string,
   strokeWidth = 1,
-  opacity = 1
+  opacity = 1,
+  markerEndId?: string
 ): void {
   const svgNs = "http://www.w3.org/2000/svg";
   const line = document.createElementNS(svgNs, "line");
@@ -792,20 +810,83 @@ function appendSvgLine(
   line.setAttribute("stroke-linecap", "round");
   line.setAttribute("vector-effect", "non-scaling-stroke");
   line.setAttribute("opacity", String(opacity));
+  if (markerEndId) {
+    line.setAttribute("marker-end", `url(#${markerEndId})`);
+  }
   parent.appendChild(line);
 }
 
-function appendSvgIntersectionDot(parent: SVGElement, x: number, y: number): void {
+function appendSvgLineLabel(
+  parent: SVGElement,
+  segment: McvLineSegment,
+  textValue: number,
+  color: string
+): void {
+  if (textValue <= 0) {
+    return;
+  }
   const svgNs = "http://www.w3.org/2000/svg";
-  const circle = document.createElementNS(svgNs, "circle");
-  circle.setAttribute("cx", String(x));
-  circle.setAttribute("cy", String(y));
-  circle.setAttribute("r", "1.5");
-  circle.setAttribute("fill", "#ffe14d");
-  circle.setAttribute("stroke", "#111821");
-  circle.setAttribute("stroke-width", "0.6");
-  circle.setAttribute("vector-effect", "non-scaling-stroke");
-  parent.appendChild(circle);
+  const text = document.createElementNS(svgNs, "text");
+  const midX = (segment[0] + segment[2]) * 0.5;
+  const midY = (segment[1] + segment[3]) * 0.5;
+  text.setAttribute("x", String(midX + 4));
+  text.setAttribute("y", String(midY - 4));
+  text.setAttribute("fill", color);
+  text.setAttribute("stroke", "#111821");
+  text.setAttribute("stroke-width", "0.6");
+  text.setAttribute("paint-order", "stroke fill");
+  text.setAttribute("font-size", "8");
+  text.setAttribute("font-weight", "700");
+  text.setAttribute("font-family", "Segoe UI, Tahoma, sans-serif");
+  text.setAttribute("vector-effect", "non-scaling-stroke");
+  text.textContent = String(textValue);
+  parent.appendChild(text);
+}
+
+function adjustDraftEdgeLength(delta: number): void {
+  if (!manualDraftLine) {
+    return;
+  }
+  manualDraftLine = {
+    ...manualDraftLine,
+    edgeLength: Math.max(0, manualDraftLine.edgeLength + delta),
+  };
+  renderCropResultFromCache();
+}
+
+function getAxisColor(axis: ManualAxis): string {
+  if (axis === "x") {
+    return "#ff4d4d";
+  }
+  if (axis === "y") {
+    return "#5dff74";
+  }
+  return "#4da1ff";
+}
+
+function getAxisMarkerId(axis: ManualAxis): string {
+  return `mcv-arrow-${axis}`;
+}
+
+function appendAxisMarkers(svg: SVGSVGElement): void {
+  const svgNs = "http://www.w3.org/2000/svg";
+  const defs = document.createElementNS(svgNs, "defs");
+  (["x", "y", "z"] as ManualAxis[]).forEach((axis) => {
+    const marker = document.createElementNS(svgNs, "marker");
+    marker.setAttribute("id", getAxisMarkerId(axis));
+    marker.setAttribute("markerWidth", "8");
+    marker.setAttribute("markerHeight", "8");
+    marker.setAttribute("refX", "7");
+    marker.setAttribute("refY", "4");
+    marker.setAttribute("orient", "auto");
+    marker.setAttribute("markerUnits", "strokeWidth");
+    const path = document.createElementNS(svgNs, "path");
+    path.setAttribute("d", "M 0 0 L 8 4 L 0 8 z");
+    path.setAttribute("fill", getAxisColor(axis));
+    marker.appendChild(path);
+    defs.appendChild(marker);
+  });
+  svg.appendChild(defs);
 }
 
 function getCropViewPointFromClient(
@@ -831,32 +912,6 @@ function getCropViewPointFromClient(
   };
 }
 
-function getLineIntersection(
-  first: McvLineSegment,
-  second: McvLineSegment
-): { x: number; y: number } | null {
-  const x1 = first[0];
-  const y1 = first[1];
-  const x2 = first[2];
-  const y2 = first[3];
-  const x3 = second[0];
-  const y3 = second[1];
-  const x4 = second[2];
-  const y4 = second[3];
-  const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
-  if (Math.abs(denom) < 1e-9) {
-    return null;
-  }
-  const detFirst = x1 * y2 - y1 * x2;
-  const detSecond = x3 * y4 - y3 * x4;
-  const x = (detFirst * (x3 - x4) - (x1 - x2) * detSecond) / denom;
-  const y = (detFirst * (y3 - y4) - (y1 - y2) * detSecond) / denom;
-  if (!Number.isFinite(x) || !Number.isFinite(y)) {
-    return null;
-  }
-  return { x, y };
-}
-
 function getCropPointFromClient(
   clientX: number,
   clientY: number,
@@ -879,29 +934,43 @@ function createManualModeCropResultSvg(
   colorDataUrl: string
 ): SVGSVGElement {
   const svg = createCropResultSvgBase(width, height, colorDataUrl);
+  appendAxisMarkers(svg);
   const sceneGroup = svg.querySelector('[data-role="viewer-scene"]') as SVGGElement | null;
   if (!sceneGroup) {
     return svg;
   }
 
-  if (manualLineSegments[0]) {
-    appendSvgLine(sceneGroup, manualLineSegments[0], "#ff4d4d", 2, 1);
+  for (const line of manualLines) {
+    const axisColor = getAxisColor(line.axis);
+    appendSvgLine(
+      sceneGroup,
+      line.segment,
+      axisColor,
+      2,
+      1,
+      getAxisMarkerId(line.axis)
+    );
+    appendSvgLineLabel(sceneGroup, line.segment, line.edgeLength, axisColor);
   }
-  if (manualLineSegments[1]) {
-    appendSvgLine(sceneGroup, manualLineSegments[1], "#5dff74", 2, 1);
-  }
-  if (manualDraftLineSegment) {
-    const draftColor = manualLineSegments.length === 0 ? "#ff4d4d" : "#5dff74";
-    appendSvgLine(sceneGroup, manualDraftLineSegment, draftColor, 2, 0.9);
-  }
-
-  const first = manualLineSegments[0];
-  const second = manualLineSegments[1];
-  if (first && second) {
-    const intersection = getLineIntersection(first, second);
-    if (intersection) {
-      appendSvgIntersectionDot(sceneGroup, intersection.x, intersection.y);
-    }
+  if (manualDraftLine) {
+    const draftSegment = manualDraftLine.flipped
+      ? ([
+          manualDraftLine.segment[2],
+          manualDraftLine.segment[3],
+          manualDraftLine.segment[0],
+          manualDraftLine.segment[1],
+        ] as McvLineSegment)
+      : manualDraftLine.segment;
+    const axisColor = getAxisColor(manualDraftLine.axis);
+    appendSvgLine(
+      sceneGroup,
+      draftSegment,
+      axisColor,
+      2,
+      0.95,
+      getAxisMarkerId(manualDraftLine.axis)
+    );
+    appendSvgLineLabel(sceneGroup, draftSegment, manualDraftLine.edgeLength, axisColor);
   }
 
   svg.addEventListener("pointerdown", (event) => {
@@ -920,10 +989,12 @@ function createManualModeCropResultSvg(
     if (!point) {
       return;
     }
-    if (manualLineSegments.length >= 2) {
-      manualLineSegments = [];
-    }
-    manualDraftLineSegment = [point.x, point.y, point.x, point.y];
+    manualDraftLine = {
+      segment: [point.x, point.y, point.x, point.y],
+      axis: manualAxisSelection,
+      flipped: manualAxisStartsBackwards,
+      edgeLength: 0,
+    };
     manualDragPointerId = event.pointerId;
     manualDragClientX = event.clientX;
     manualDragClientY = event.clientY;
@@ -954,6 +1025,14 @@ function createManualModeCropResultSvg(
     viewerMotion.y = viewPoint.y - imageY * nextZoom;
     viewerMotion.zoom = nextZoom;
     applyViewerTransformToSvg();
+  });
+
+  svg.addEventListener("contextmenu", (event) => {
+    if (!cropResultCache || event.ctrlKey || viewerCtrlHeld) {
+      return;
+    }
+    event.preventDefault();
+    adjustDraftEdgeLength(1);
   });
 
   applyViewerTransformToSvg();
@@ -1029,7 +1108,7 @@ function updateManualDraftFromPointer(pointer: PointerEvent): void {
     !cropResultCache ||
     manualDragPointerId === null ||
     pointer.pointerId !== manualDragPointerId ||
-    !manualDraftLineSegment
+    !manualDraftLine
   ) {
     return;
   }
@@ -1044,12 +1123,15 @@ function updateManualDraftFromPointer(pointer: PointerEvent): void {
   if (!point) {
     return;
   }
-  manualDraftLineSegment = [
-    manualDraftLineSegment[0],
-    manualDraftLineSegment[1],
-    point.x,
-    point.y,
-  ];
+  manualDraftLine = {
+    ...manualDraftLine,
+    segment: [
+      manualDraftLine.segment[0],
+      manualDraftLine.segment[1],
+      point.x,
+      point.y,
+    ],
+  };
   renderCropResultFromCache();
 }
 
@@ -1075,7 +1157,7 @@ function finalizeManualDraftFromPointer(pointer: PointerEvent): void {
     return;
   }
   manualDragPointerId = null;
-  if (!manualDraftLineSegment) {
+  if (!manualDraftLine) {
     return;
   }
   const point = getCropPointFromClient(
@@ -1084,20 +1166,27 @@ function finalizeManualDraftFromPointer(pointer: PointerEvent): void {
     cropResultCache.width,
     cropResultCache.height
   );
-  const committedSegment: McvLineSegment = point
-    ? [manualDraftLineSegment[0], manualDraftLineSegment[1], point.x, point.y]
-    : manualDraftLineSegment;
-  manualDraftLineSegment = null;
+  const draftSegment: McvLineSegment = point
+    ? [manualDraftLine.segment[0], manualDraftLine.segment[1], point.x, point.y]
+    : manualDraftLine.segment;
+  const committedSegment: McvLineSegment = manualDraftLine.flipped
+    ? [draftSegment[2], draftSegment[3], draftSegment[0], draftSegment[1]]
+    : draftSegment;
+  const committedAxis = manualDraftLine.axis;
+  const committedEdgeLength = manualDraftLine.edgeLength;
+  manualDraftLine = null;
 
   const length = Math.hypot(
     committedSegment[2] - committedSegment[0],
     committedSegment[3] - committedSegment[1]
   );
   if (length >= 2) {
-    manualLineSegments.push(committedSegment);
-    if (manualLineSegments.length > 2) {
-      manualLineSegments = manualLineSegments.slice(-2);
-    }
+    manualLines.push({
+      segment: committedSegment,
+      axis: committedAxis,
+      edgeLength: committedEdgeLength,
+    });
+    manualRedoLines = [];
   }
   renderCropResultFromCache();
 }
@@ -2201,13 +2290,109 @@ function restoreFullUncroppedImageView(): void {
 
 function handleViewerKeybind(event: KeyboardEvent): void {
   if (event.key === "Escape") {
-    const fullImage = getViewerFullImageNode();
-    const hasCropView = !!cropResultCache || !!(fullImage && fullImage.classList.contains("hidden"));
-    if (hasCropView) {
+    if (cropResultCache && viewerMedia?.kind === "image" && manualDraftLine) {
       event.preventDefault();
-      restoreFullUncroppedImageView();
+      manualDraftLine = null;
+      manualDragPointerId = null;
+      renderCropResultFromCache();
     }
     return;
+  }
+
+  const target = event.target as HTMLElement | null;
+  const targetIsEditable =
+    !!target &&
+    (target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.isContentEditable);
+
+  if (cropResultCache && viewerMedia?.kind === "image" && !targetIsEditable) {
+    if (event.ctrlKey && !event.shiftKey && (event.key === "z" || event.key === "Z")) {
+      event.preventDefault();
+      if (manualDraftLine) {
+        manualDraftLine = null;
+        manualDragPointerId = null;
+      } else if (manualLines.length > 0) {
+        const removed = manualLines.pop();
+        if (removed) {
+          manualRedoLines.push(removed);
+        }
+      }
+      renderCropResultFromCache();
+      return;
+    }
+    if (event.ctrlKey && !event.shiftKey && (event.key === "y" || event.key === "Y")) {
+      event.preventDefault();
+      const restored = manualRedoLines.pop();
+      if (restored) {
+        manualLines.push(restored);
+        renderCropResultFromCache();
+      }
+      return;
+    }
+
+    if (event.key === "ArrowUp" || event.key === "=" || event.key === "+") {
+      event.preventDefault();
+      adjustDraftEdgeLength(1);
+      return;
+    }
+    if (event.key === "ArrowDown" || event.key === "-" || event.key === "_") {
+      event.preventDefault();
+      adjustDraftEdgeLength(-1);
+      return;
+    }
+
+    const applyAxisSelection = (axis: ManualAxis, startsBackwards: boolean) => {
+      manualAxisSelection = axis;
+      manualAxisStartsBackwards = startsBackwards;
+      if (manualDraftLine) {
+        manualDraftLine = {
+          ...manualDraftLine,
+          axis,
+          flipped: startsBackwards,
+        };
+        renderCropResultFromCache();
+      }
+    };
+    if (event.key === "1" || event.code === "Numpad1") {
+      applyAxisSelection("x", false);
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "2" || event.code === "Numpad2") {
+      applyAxisSelection("y", false);
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "3" || event.code === "Numpad3") {
+      applyAxisSelection("z", false);
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "q" || event.key === "Q") {
+      applyAxisSelection("x", true);
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "w" || event.key === "W") {
+      applyAxisSelection("y", true);
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "e" || event.key === "E") {
+      applyAxisSelection("z", true);
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "Tab" && manualDraftLine) {
+      event.preventDefault();
+      manualDraftLine = {
+        ...manualDraftLine,
+        flipped: !manualDraftLine.flipped,
+      };
+      renderCropResultFromCache();
+      return;
+    }
   }
 
   if (!viewerVideoNode || !viewerMedia || viewerMedia.kind !== "video") {
@@ -2216,13 +2401,7 @@ function handleViewerKeybind(event: KeyboardEvent): void {
   if (viewerEditingField) {
     return;
   }
-  const target = event.target as HTMLElement | null;
-  if (
-    target &&
-    (target.tagName === "INPUT" ||
-      target.tagName === "TEXTAREA" ||
-      target.isContentEditable)
-  ) {
+  if (targetIsEditable) {
     return;
   }
 
@@ -2350,7 +2529,7 @@ function installUiHandlers(): void {
       if (
         manualDragPointerId !== null &&
         !viewerInput.grabbed &&
-        manualDraftLineSegment
+        manualDraftLine
       ) {
         engageViewerGrab(manualDragPointerId);
       }
