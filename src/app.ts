@@ -201,6 +201,7 @@ let manualDragPointerId: number | null = null;
 let manualDragClientX = 0;
 let manualDragClientY = 0;
 let viewerCtrlHeld = false;
+let renderAnnotationPreviewHeld = false;
 let viewerMotionRafId: number | null = null;
 const viewerMotion = {
   x: 0,
@@ -293,11 +294,169 @@ function createStructureLineFromAnnotation(annotation: ManualAnnotation): Struct
   };
 }
 
+function getInfiniteLineIntersection(
+  first: ManualAnnotation,
+  second: ManualAnnotation
+): ManualPoint | null {
+  const x1 = first.from.x;
+  const y1 = first.from.y;
+  const x2 = first.to.x;
+  const y2 = first.to.y;
+  const x3 = second.from.x;
+  const y3 = second.from.y;
+  const x4 = second.to.x;
+  const y4 = second.to.y;
+  const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+  if (Math.abs(denom) < 1e-9) {
+    return null;
+  }
+  const detFirst = x1 * y2 - y1 * x2;
+  const detSecond = x3 * y4 - y3 * x4;
+  const x = (detFirst * (x3 - x4) - (x1 - x2) * detSecond) / denom;
+  const y = (detFirst * (y3 - y4) - (y1 - y2) * detSecond) / denom;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+  return { x, y };
+}
+
+function getLeastSquaresLinePoint(lines: ManualAnnotation[]): ManualPoint | null {
+  let a00 = 0;
+  let a01 = 0;
+  let a11 = 0;
+  let b0 = 0;
+  let b1 = 0;
+  let used = 0;
+  for (const line of lines) {
+    const dxRaw = line.to.x - line.from.x;
+    const dyRaw = line.to.y - line.from.y;
+    const length = Math.hypot(dxRaw, dyRaw);
+    if (length < 1e-9) {
+      continue;
+    }
+    used += 1;
+    const dx = dxRaw / length;
+    const dy = dyRaw / length;
+    const m00 = 1 - dx * dx;
+    const m01 = -dx * dy;
+    const m11 = 1 - dy * dy;
+    a00 += m00;
+    a01 += m01;
+    a11 += m11;
+    b0 += m00 * line.from.x + m01 * line.from.y;
+    b1 += m01 * line.from.x + m11 * line.from.y;
+  }
+  if (used < 2) {
+    return null;
+  }
+  const det = a00 * a11 - a01 * a01;
+  if (Math.abs(det) < 1e-9) {
+    return null;
+  }
+  const x = (b0 * a11 - b1 * a01) / det;
+  const y = (a00 * b1 - a01 * b0) / det;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+  return { x, y };
+}
+
+function setStructureEndpointPoint(
+  endpointId: number,
+  point: ManualPoint
+): void {
+  const lineIndex = Math.floor(endpointId / 2);
+  const endpoint = endpointId % 2 === 0 ? "from" : "to";
+  const line = MCV_DATA.structure.lines[lineIndex];
+  if (!line) {
+    return;
+  }
+  line[endpoint].x = point.x;
+  line[endpoint].y = point.y;
+}
+
+function recomputeStructureGeometryFromConnections(): void {
+  const annotations = MCV_DATA.annotations;
+  const structureLines = MCV_DATA.structure.lines;
+  if (annotations.length !== structureLines.length) {
+    return;
+  }
+
+  // Always restart from raw annotations so refinement never cascades.
+  for (let i = 0; i < structureLines.length; i += 1) {
+    structureLines[i].from.x = annotations[i].from.x;
+    structureLines[i].from.y = annotations[i].from.y;
+    structureLines[i].to.x = annotations[i].to.x;
+    structureLines[i].to.y = annotations[i].to.y;
+  }
+
+  const endpointCount = structureLines.length * 2;
+  const adjacency = Array.from({ length: endpointCount }, () => new Set<number>());
+  const connect = (a: number, b: number) => {
+    if (a < 0 || b < 0 || a >= endpointCount || b >= endpointCount || a === b) {
+      return;
+    }
+    adjacency[a].add(b);
+    adjacency[b].add(a);
+  };
+  for (let i = 0; i < structureLines.length; i += 1) {
+    const line = structureLines[i];
+    const fromId = i * 2;
+    const toId = i * 2 + 1;
+    line.from.from.forEach((other) => connect(fromId, other * 2));
+    line.from.to.forEach((other) => connect(fromId, other * 2 + 1));
+    line.to.from.forEach((other) => connect(toId, other * 2));
+    line.to.to.forEach((other) => connect(toId, other * 2 + 1));
+  }
+
+  const visited = new Array(endpointCount).fill(false);
+  for (let start = 0; start < endpointCount; start += 1) {
+    if (visited[start] || adjacency[start].size === 0) {
+      continue;
+    }
+    const stack = [start];
+    const component: number[] = [];
+    visited[start] = true;
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      component.push(current);
+      adjacency[current].forEach((next) => {
+        if (!visited[next]) {
+          visited[next] = true;
+          stack.push(next);
+        }
+      });
+    }
+    const uniqueLineIndexes = Array.from(
+      new Set(component.map((endpointId) => Math.floor(endpointId / 2)))
+    );
+    if (uniqueLineIndexes.length < 2) {
+      continue;
+    }
+    const linesForSolve = uniqueLineIndexes.map((index) => annotations[index]);
+    let snapPoint: ManualPoint | null = null;
+    if (linesForSolve.length === 2) {
+      snapPoint =
+        getInfiniteLineIntersection(linesForSolve[0], linesForSolve[1]) ??
+        getLeastSquaresLinePoint(linesForSolve);
+    } else {
+      snapPoint = getLeastSquaresLinePoint(linesForSolve);
+    }
+    if (!snapPoint) {
+      continue;
+    }
+    component.forEach((endpointId) => {
+      setStructureEndpointPoint(endpointId, snapPoint!);
+    });
+  }
+}
+
 function linkLineIndexAgainstOthers(lineIndex: number): void {
   const lines = MCV_DATA.structure.lines;
   if (lineIndex < 0 || lineIndex >= lines.length) {
     return;
   }
+  const annotations = MCV_DATA.annotations;
   const line = lines[lineIndex];
   line.from.from.length = 0;
   line.from.to.length = 0;
@@ -313,10 +472,15 @@ function linkLineIndexAgainstOthers(lineIndex: number): void {
     if (other.axis === line.axis) {
       continue;
     }
+    const lineAnnotation = annotations[lineIndex];
+    const otherAnnotation = annotations[otherIndex];
+    if (!lineAnnotation || !otherAnnotation) {
+      continue;
+    }
     (["from", "to"] as const).forEach((lineEndpoint) => {
       (["from", "to"] as const).forEach((otherEndpoint) => {
-        const firstPoint = line[lineEndpoint];
-        const secondPoint = other[otherEndpoint];
+        const firstPoint = lineAnnotation[lineEndpoint];
+        const secondPoint = otherAnnotation[otherEndpoint];
         const distance = Math.hypot(firstPoint.x - secondPoint.x, firstPoint.y - secondPoint.y);
         if (distance <= threshold) {
           linkStructureEndpoints(line, lineEndpoint, other, otherEndpoint, lineIndex, otherIndex);
@@ -330,6 +494,7 @@ function pushAnnotationWithStructureLink(annotation: ManualAnnotation): void {
   MCV_DATA.annotations.push(annotation);
   MCV_DATA.structure.lines.push(createStructureLineFromAnnotation(annotation));
   linkLineIndexAgainstOthers(MCV_DATA.structure.lines.length - 1);
+  recomputeStructureGeometryFromConnections();
 }
 
 function popAnnotationWithStructureUnlink(): ManualAnnotation | undefined {
@@ -345,6 +510,7 @@ function popAnnotationWithStructureUnlink(): ManualAnnotation | undefined {
     line.to.from = line.to.from.filter((value) => value !== removedIndex);
     line.to.to = line.to.to.filter((value) => value !== removedIndex);
   });
+  recomputeStructureGeometryFromConnections();
   return removed;
 }
 
@@ -354,6 +520,7 @@ function rebuildStructureFromAnnotations(): void {
   for (let i = 0; i < MCV_DATA.structure.lines.length; i += 1) {
     linkLineIndexAgainstOthers(i);
   }
+  recomputeStructureGeometryFromConnections();
 }
 
 function resetCropInteractionState(): void {
@@ -365,6 +532,7 @@ function resetCropInteractionState(): void {
   manualDragClientX = 0;
   manualDragClientY = 0;
   manualAxisStartsBackwards = false;
+  renderAnnotationPreviewHeld = false;
 }
 
 function isThenable(value: unknown): value is Promise<unknown> {
@@ -1014,8 +1182,8 @@ function adjustDraftEdgeLength(delta: number): void {
   renderCropResultFromCache();
 }
 
-function getLineSegmentForAnnotation(annotation: ManualAnnotation): McvLineSegment {
-  return [annotation.from.x, annotation.from.y, annotation.to.x, annotation.to.y];
+function getLineSegmentForLine(line: { from: ManualPoint; to: ManualPoint }): McvLineSegment {
+  return [line.from.x, line.from.y, line.to.x, line.to.y];
 }
 
 function getLineSegmentForDraft(draft: DraftManualLine): McvLineSegment {
@@ -1110,9 +1278,12 @@ function createManualModeCropResultSvg(
     return svg;
   }
 
-  for (const line of MCV_DATA.annotations) {
+  const linesToRender: Array<ManualAnnotation | StructureLine> = renderAnnotationPreviewHeld
+    ? MCV_DATA.annotations
+    : MCV_DATA.structure.lines;
+  for (const line of linesToRender) {
     const axisColor = getAxisColor(line.axis);
-    const segment = getLineSegmentForAnnotation(line);
+    const segment = getLineSegmentForLine(line);
     appendSvgLine(
       sceneGroup,
       segment,
@@ -2689,6 +2860,21 @@ function installUiHandlers(): void {
   }
   document.addEventListener("keydown", handleViewerKeybind);
   document.addEventListener("keydown", (event) => {
+    const target = event.target as HTMLElement | null;
+    const targetIsEditable =
+      !!target &&
+      (target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable);
+    if (event.code === "Backquote" && !targetIsEditable) {
+      if (!renderAnnotationPreviewHeld) {
+        renderAnnotationPreviewHeld = true;
+        if (cropResultCache && viewerMedia?.kind === "image") {
+          renderCropResultFromCache();
+        }
+      }
+      return;
+    }
     if (event.key === "Control") {
       viewerCtrlHeld = true;
       if (
@@ -2702,6 +2888,15 @@ function installUiHandlers(): void {
     }
   });
   document.addEventListener("keyup", (event) => {
+    if (event.code === "Backquote") {
+      if (renderAnnotationPreviewHeld) {
+        renderAnnotationPreviewHeld = false;
+        if (cropResultCache && viewerMedia?.kind === "image") {
+          renderCropResultFromCache();
+        }
+      }
+      return;
+    }
     if (event.key === "Control") {
       viewerCtrlHeld = false;
       if (
@@ -2717,6 +2912,12 @@ function installUiHandlers(): void {
   window.addEventListener("blur", () => {
     viewerCtrlHeld = false;
     releaseViewerGrab();
+    if (renderAnnotationPreviewHeld) {
+      renderAnnotationPreviewHeld = false;
+      if (cropResultCache && viewerMedia?.kind === "image") {
+        renderCropResultFromCache();
+      }
+    }
     updateViewerCursor();
   });
   document.addEventListener("pointermove", (event) => {
