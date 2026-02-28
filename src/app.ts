@@ -1,4 +1,4 @@
-type McvOperation = "cv.opencvTest";
+type McvOperation = "cv.opencvTest" | "cv.poseSolve";
 
 type McvRequest<TArgs = Record<string, unknown>> = {
   op: McvOperation;
@@ -32,6 +32,42 @@ type McvImagePipelineArgs = {
   image_data_url: string;
   canny_threshold1?: number;
   canny_threshold2?: number;
+};
+
+type McvPoseSolveArgs = {
+  width: number;
+  height: number;
+  lines: StructureLine[];
+  vertices: StructureVertexData[];
+  initial_vfov_deg?: number;
+};
+
+type McvPoseSolveResult = {
+  point_count: number;
+  inlier_count: number;
+  image_width: number;
+  image_height: number;
+  initial_vfov_deg: number;
+  initial_focal_px: number;
+  optimized_focal_px: number;
+  optimized_hfov_deg: number;
+  optimized_vfov_deg: number;
+  reprojection_rmse_px: number;
+  camera_position: {
+    x: number;
+    y: number;
+    z: number;
+  };
+  player_position: {
+    x: number;
+    y: number;
+    z: number;
+  };
+  rotation: {
+    yaw: number;
+    pitch: number;
+  };
+  tp_command: string;
 };
 
 type McvLineSegment = [number, number, number, number];
@@ -102,7 +138,7 @@ type DraftManualLine = {
   flipped: boolean;
   length?: number;
 };
-type ManualInteractionMode = "draw" | "anchor" | "edit" | "vertexSolve";
+type ManualInteractionMode = "draw" | "anchor" | "edit" | "vertexSolve" | "poseSolve";
 type StructureVertex = {
   endpointIds: number[];
   point: ManualPoint;
@@ -113,6 +149,8 @@ type VertexSolveRenderData = {
   generatedVertexIndexes: Set<number>;
   anchorVertexIndexes: Set<number>;
   conflictVertexIndex: number | null;
+  conflictCoordPair: { existing: VertexSolveCoord; inferred: VertexSolveCoord } | null;
+  topologyCoords: VertexSolveCoord[];
   topologyVertices: StructureVertex[];
 };
 type VertexSolveCoord = {
@@ -156,6 +194,7 @@ type McvClientApi = {
   mcv: {
     call: typeof callMcvApi;
     runImagePipeline: typeof runImagePipeline;
+    runPoseSolve: typeof runPoseSolve;
     backend: "python" | "web";
   };
 };
@@ -278,6 +317,15 @@ let manualAnchorHoveredVertex: StructureVertex | null = null;
 let manualEditHoveredLineIndex: number | null = null;
 let manualEditSelectedLineIndex: number | null = null;
 let vertexSolveRenderData: VertexSolveRenderData | null = null;
+let vertexSolveHoveredVertexIndex: number | null = null;
+let poseSolveState:
+  | {
+      status: "idle" | "running" | "done" | "error";
+      result?: McvPoseSolveResult;
+      error?: string;
+    }
+  | null = null;
+let poseSolveRunToken = 0;
 let viewerCtrlHeld = false;
 let renderAnnotationPreviewHeld = false;
 let viewerMotionRafId: number | null = null;
@@ -785,6 +833,9 @@ function resetCropInteractionState(): void {
   manualEditHoveredLineIndex = null;
   manualEditSelectedLineIndex = null;
   vertexSolveRenderData = null;
+  vertexSolveHoveredVertexIndex = null;
+  poseSolveState = null;
+  poseSolveRunToken += 1;
   manualAxisStartsBackwards = false;
   renderAnnotationPreviewHeld = false;
   clearAnnotationsDirty();
@@ -1029,9 +1080,507 @@ async function runImagePipeline(args: McvImagePipelineArgs): Promise<McvImagePip
   return await runPythonImagePipeline(args);
 }
 
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+type PoseCorrespondence = {
+  image: [number, number];
+  world: [number, number, number];
+};
+
+function buildPoseCorrespondencesFromStructure(
+  lines: StructureLine[],
+  vertices: StructureVertexData[]
+): PoseCorrespondence[] {
+  const correspondences: PoseCorrespondence[] = [];
+  for (const vertex of vertices) {
+    if (!isFiniteNumber(vertex.x) || !isFiniteNumber(vertex.y) || !isFiniteNumber(vertex.z)) {
+      continue;
+    }
+    const endpointIds = new Set<number>();
+    vertex.from.forEach((lineIndex) => {
+      if (Number.isInteger(lineIndex) && lineIndex >= 0 && lineIndex < lines.length) {
+        endpointIds.add(lineIndex * 2);
+      }
+    });
+    vertex.to.forEach((lineIndex) => {
+      if (Number.isInteger(lineIndex) && lineIndex >= 0 && lineIndex < lines.length) {
+        endpointIds.add(lineIndex * 2 + 1);
+      }
+    });
+    let sumX = 0;
+    let sumY = 0;
+    let count = 0;
+    endpointIds.forEach((endpointId) => {
+      const lineIndex = Math.floor(endpointId / 2);
+      const endpointKey = endpointId % 2 === 0 ? "from" : "to";
+      const line = lines[lineIndex];
+      if (!line) {
+        return;
+      }
+      const endpoint = line[endpointKey];
+      if (!isFiniteNumber(endpoint.x) || !isFiniteNumber(endpoint.y)) {
+        return;
+      }
+      sumX += endpoint.x;
+      sumY += endpoint.y;
+      count += 1;
+    });
+    if (count <= 0) {
+      continue;
+    }
+    correspondences.push({
+      image: [sumX / count, sumY / count],
+      world: [vertex.x, vertex.y, vertex.z],
+    });
+  }
+  return correspondences;
+}
+
+function cameraMatrixFromFocalWeb(cv: any, focal: number, width: number, height: number): any {
+  const cx = (width - 1) * 0.5;
+  const cy = (height - 1) * 0.5;
+  return cv.matFromArray(3, 3, cv.CV_64FC1, [focal, 0, cx, 0, focal, cy, 0, 0, 1]);
+}
+
+function buildPosePointMats(cv: any, correspondences: PoseCorrespondence[]): { objectPts: any; imagePts: any } {
+  const objectData: number[] = [];
+  const imageData: number[] = [];
+  correspondences.forEach((entry) => {
+    objectData.push(entry.world[0], entry.world[1], entry.world[2]);
+    imageData.push(entry.image[0], entry.image[1]);
+  });
+  return {
+    objectPts: cv.matFromArray(correspondences.length, 1, cv.CV_64FC3, objectData),
+    imagePts: cv.matFromArray(correspondences.length, 1, cv.CV_64FC2, imageData),
+  };
+}
+
+function extractInlierIndexesFromMat(inliersMat: any, pointCount: number): number[] {
+  if (!inliersMat || typeof inliersMat.rows !== "number" || inliersMat.rows <= 0) {
+    return [];
+  }
+  const raw: number[] = [];
+  const data32S = inliersMat.data32S as Int32Array | undefined;
+  const data32F = inliersMat.data32F as Float32Array | undefined;
+  const data64F = inliersMat.data64F as Float64Array | undefined;
+  if (data32S && data32S.length > 0) {
+    for (let i = 0; i < data32S.length; i += 1) {
+      raw.push(Number(data32S[i]));
+    }
+  } else if (data32F && data32F.length > 0) {
+    for (let i = 0; i < data32F.length; i += 1) {
+      raw.push(Math.round(Number(data32F[i])));
+    }
+  } else if (data64F && data64F.length > 0) {
+    for (let i = 0; i < data64F.length; i += 1) {
+      raw.push(Math.round(Number(data64F[i])));
+    }
+  }
+  return Array.from(
+    new Set(
+      raw.filter((index) => Number.isInteger(index) && index >= 0 && index < pointCount)
+    )
+  ).sort((a, b) => a - b);
+}
+
+function getVec3FromMat(mat: any): [number, number, number] {
+  const data64 = mat?.data64F as Float64Array | undefined;
+  if (data64 && data64.length >= 3) {
+    return [Number(data64[0]), Number(data64[1]), Number(data64[2])];
+  }
+  const data32 = mat?.data32F as Float32Array | undefined;
+  if (data32 && data32.length >= 3) {
+    return [Number(data32[0]), Number(data32[1]), Number(data32[2])];
+  }
+  return [0, 0, 0];
+}
+
+function evaluatePoseForFocalWeb(
+  cv: any,
+  correspondences: PoseCorrespondence[],
+  width: number,
+  height: number,
+  focal: number
+): {
+  cost: number;
+  inlierCount: number;
+  rvec: [number, number, number];
+  tvec: [number, number, number];
+  rmse: number;
+} {
+  let objectPts: any = null;
+  let imagePts: any = null;
+  let camera: any = null;
+  let dist: any = null;
+  let rvec: any = null;
+  let tvec: any = null;
+  let inliers: any = null;
+  let projected: any = null;
+  let objectPtsInlier: any = null;
+  let imagePtsInlier: any = null;
+  try {
+    const mats = buildPosePointMats(cv, correspondences);
+    objectPts = mats.objectPts;
+    imagePts = mats.imagePts;
+    camera = cameraMatrixFromFocalWeb(cv, focal, width, height);
+    dist = cv.Mat.zeros(4, 1, cv.CV_64FC1);
+    rvec = new cv.Mat();
+    tvec = new cv.Mat();
+    inliers = new cv.Mat();
+
+    const pointCount = correspondences.length;
+    let ok = false;
+    try {
+      ok = cv.solvePnPRansac(
+        objectPts,
+        imagePts,
+        camera,
+        dist,
+        rvec,
+        tvec,
+        false,
+        800,
+        4.0,
+        0.999,
+        inliers,
+        cv.SOLVEPNP_EPNP
+      );
+    } catch {
+      ok = false;
+    }
+
+    if (!ok) {
+      try {
+        ok = cv.solvePnP(
+          objectPts,
+          imagePts,
+          camera,
+          dist,
+          rvec,
+          tvec,
+          false,
+          cv.SOLVEPNP_ITERATIVE
+        );
+      } catch {
+        ok = false;
+      }
+      if (!ok) {
+        return {
+          cost: Number.POSITIVE_INFINITY,
+          inlierCount: 0,
+          rvec: [0, 0, 0],
+          tvec: [0, 0, 0],
+          rmse: Number.POSITIVE_INFINITY,
+        };
+      }
+    }
+
+    let inlierIndexes = extractInlierIndexesFromMat(inliers, pointCount);
+    if (inlierIndexes.length < 4) {
+      inlierIndexes = Array.from({ length: pointCount }, (_, index) => index);
+    }
+    const objectInlierData: number[] = [];
+    const imageInlierData: number[] = [];
+    inlierIndexes.forEach((index) => {
+      objectInlierData.push(
+        correspondences[index].world[0],
+        correspondences[index].world[1],
+        correspondences[index].world[2]
+      );
+      imageInlierData.push(correspondences[index].image[0], correspondences[index].image[1]);
+    });
+    objectPtsInlier = cv.matFromArray(inlierIndexes.length, 1, cv.CV_64FC3, objectInlierData);
+    imagePtsInlier = cv.matFromArray(inlierIndexes.length, 1, cv.CV_64FC2, imageInlierData);
+    try {
+      const okRefine = cv.solvePnP(
+        objectPtsInlier,
+        imagePtsInlier,
+        camera,
+        dist,
+        rvec,
+        tvec,
+        true,
+        cv.SOLVEPNP_ITERATIVE
+      );
+      if (!okRefine) {
+        return {
+          cost: Number.POSITIVE_INFINITY,
+          inlierCount: inlierIndexes.length,
+          rvec: [0, 0, 0],
+          tvec: [0, 0, 0],
+          rmse: Number.POSITIVE_INFINITY,
+        };
+      }
+      if (typeof cv.solvePnPRefineLM === "function") {
+        try {
+          cv.solvePnPRefineLM(objectPtsInlier, imagePtsInlier, camera, dist, rvec, tvec);
+        } catch {
+          // Optional refinement is best effort.
+        }
+      }
+    } catch {
+      return {
+        cost: Number.POSITIVE_INFINITY,
+        inlierCount: inlierIndexes.length,
+        rvec: [0, 0, 0],
+        tvec: [0, 0, 0],
+        rmse: Number.POSITIVE_INFINITY,
+      };
+    }
+
+    projected = new cv.Mat();
+    cv.projectPoints(objectPts, rvec, tvec, camera, dist, projected);
+    const projData = (projected.data64F as Float64Array | undefined) ?? new Float64Array();
+    const delta = 5.0;
+    let huberSum = 0;
+    let sqSum = 0;
+    let errCount = 0;
+    for (let i = 0; i < correspondences.length; i += 1) {
+      const px = Number(projData[i * 2]);
+      const py = Number(projData[i * 2 + 1]);
+      const dx = px - correspondences[i].image[0];
+      const dy = py - correspondences[i].image[1];
+      const err = Math.hypot(dx, dy);
+      huberSum += err <= delta ? 0.5 * err * err : delta * (err - 0.5 * delta);
+      sqSum += err * err;
+      errCount += 1;
+    }
+    const outlierPenalty = (pointCount - inlierIndexes.length) * delta * delta;
+    const cost = errCount > 0 ? huberSum / errCount + outlierPenalty : Number.POSITIVE_INFINITY;
+    const rmse = errCount > 0 ? Math.sqrt(sqSum / errCount) : Number.POSITIVE_INFINITY;
+
+    return {
+      cost,
+      inlierCount: inlierIndexes.length,
+      rvec: getVec3FromMat(rvec),
+      tvec: getVec3FromMat(tvec),
+      rmse,
+    };
+  } finally {
+    if (imagePtsInlier && typeof imagePtsInlier.delete === "function") {
+      imagePtsInlier.delete();
+    }
+    if (objectPtsInlier && typeof objectPtsInlier.delete === "function") {
+      objectPtsInlier.delete();
+    }
+    if (projected && typeof projected.delete === "function") {
+      projected.delete();
+    }
+    if (inliers && typeof inliers.delete === "function") {
+      inliers.delete();
+    }
+    if (tvec && typeof tvec.delete === "function") {
+      tvec.delete();
+    }
+    if (rvec && typeof rvec.delete === "function") {
+      rvec.delete();
+    }
+    if (dist && typeof dist.delete === "function") {
+      dist.delete();
+    }
+    if (camera && typeof camera.delete === "function") {
+      camera.delete();
+    }
+    if (imagePts && typeof imagePts.delete === "function") {
+      imagePts.delete();
+    }
+    if (objectPts && typeof objectPts.delete === "function") {
+      objectPts.delete();
+    }
+  }
+}
+
+function goldenSectionSearchWeb(
+  fn: (value: number) => number,
+  lo: number,
+  hi: number,
+  iterations = 48
+): { x: number; value: number } {
+  const phi = (1 + Math.sqrt(5)) * 0.5;
+  const invPhi = 1 / phi;
+  let x1 = hi - (hi - lo) * invPhi;
+  let x2 = lo + (hi - lo) * invPhi;
+  let f1 = fn(x1);
+  let f2 = fn(x2);
+  for (let i = 0; i < iterations; i += 1) {
+    if (f1 < f2) {
+      hi = x2;
+      x2 = x1;
+      f2 = f1;
+      x1 = hi - (hi - lo) * invPhi;
+      f1 = fn(x1);
+    } else {
+      lo = x1;
+      x1 = x2;
+      f1 = f2;
+      x2 = lo + (hi - lo) * invPhi;
+      f2 = fn(x2);
+    }
+  }
+  return f1 < f2 ? { x: x1, value: f1 } : { x: x2, value: f2 };
+}
+
+function wrapDegrees180(angleDeg: number): number {
+  return ((angleDeg + 180) % 360) - 180;
+}
+
+function poseToCameraWorldAndMinecraftAnglesWeb(
+  cv: any,
+  rvec: [number, number, number],
+  tvec: [number, number, number]
+): { camera: [number, number, number]; yaw: number; pitch: number } {
+  let rvecMat: any = null;
+  let rmat: any = null;
+  try {
+    rvecMat = cv.matFromArray(3, 1, cv.CV_64FC1, [rvec[0], rvec[1], rvec[2]]);
+    rmat = new cv.Mat();
+    cv.Rodrigues(rvecMat, rmat);
+    const r = (rmat.data64F as Float64Array | undefined) ?? new Float64Array();
+    const tx = tvec[0];
+    const ty = tvec[1];
+    const tz = tvec[2];
+    const camX = -(r[0] * tx + r[3] * ty + r[6] * tz);
+    const camY = -(r[1] * tx + r[4] * ty + r[7] * tz);
+    const camZ = -(r[2] * tx + r[5] * ty + r[8] * tz);
+    let fx = r[6];
+    let fy = r[7];
+    let fz = r[8];
+    const norm = Math.hypot(fx, fy, fz);
+    if (norm > 1e-12) {
+      fx /= norm;
+      fy /= norm;
+      fz /= norm;
+    }
+    const pitch = (Math.asin(Math.max(-1, Math.min(1, -fy))) * 180) / Math.PI;
+    const yaw = wrapDegrees180((Math.atan2(-fx, fz) * 180) / Math.PI);
+    return {
+      camera: [camX, camY, camZ],
+      yaw,
+      pitch,
+    };
+  } finally {
+    if (rmat && typeof rmat.delete === "function") {
+      rmat.delete();
+    }
+    if (rvecMat && typeof rvecMat.delete === "function") {
+      rvecMat.delete();
+    }
+  }
+}
+
+async function runWebPoseSolve(args: McvPoseSolveArgs): Promise<McvPoseSolveResult> {
+  const cv = await getWebMcvRuntime();
+  const width = Math.floor(Number(args.width));
+  const height = Math.floor(Number(args.height));
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new Error("width and height must be positive integers");
+  }
+  const lines = Array.isArray(args.lines) ? args.lines : [];
+  const vertices = Array.isArray(args.vertices) ? args.vertices : [];
+  const correspondences = buildPoseCorrespondencesFromStructure(lines, vertices);
+  if (correspondences.length < 4) {
+    throw new Error("Need at least 4 valid vertex correspondences with known world coordinates");
+  }
+
+  const initialVfovDeg =
+    isFiniteNumber(args.initial_vfov_deg) && args.initial_vfov_deg > 1 && args.initial_vfov_deg < 179
+      ? args.initial_vfov_deg
+      : 70;
+  const fInit = (height * 0.5) / Math.tan((initialVfovDeg * 0.5 * Math.PI) / 180);
+  const fMin = Math.max(20, fInit * 0.3);
+  const fMax = fInit * 3;
+
+  const cache = new Map<number, ReturnType<typeof evaluatePoseForFocalWeb>>();
+  const evalLogF = (logf: number): number => {
+    if (!cache.has(logf)) {
+      const focal = Math.exp(logf);
+      cache.set(logf, evaluatePoseForFocalWeb(cv, correspondences, width, height, focal));
+    }
+    return cache.get(logf)!.cost;
+  };
+
+  const sampleCount = 44;
+  const logs: number[] = [];
+  for (let i = 0; i < sampleCount; i += 1) {
+    logs.push(Math.log(fMin) + (Math.log(fMax) - Math.log(fMin)) * (i / (sampleCount - 1)));
+  }
+  const costs = logs.map((logf) => evalLogF(logf));
+  let bestIdx = 0;
+  for (let i = 1; i < costs.length; i += 1) {
+    if (costs[i] < costs[bestIdx]) {
+      bestIdx = i;
+    }
+  }
+  const loIdx = Math.max(0, bestIdx - 2);
+  const hiIdx = Math.min(logs.length - 1, bestIdx + 2);
+  let lo = logs[loIdx];
+  let hi = logs[hiIdx];
+  if (!(hi > lo)) {
+    lo = logs[0];
+    hi = logs[logs.length - 1];
+  }
+
+  const bestLog = goldenSectionSearchWeb(evalLogF, lo, hi, 32).x;
+  const bestFocal = Math.exp(bestLog);
+  const bestPose = evaluatePoseForFocalWeb(cv, correspondences, width, height, bestFocal);
+  if (!Number.isFinite(bestPose.cost)) {
+    throw new Error("Focal search failed to find a valid PnP solution");
+  }
+
+  const hfovDeg = (2 * Math.atan((width * 0.5) / bestFocal) * 180) / Math.PI;
+  const vfovDeg = (2 * Math.atan((height * 0.5) / bestFocal) * 180) / Math.PI;
+  const worldPose = poseToCameraWorldAndMinecraftAnglesWeb(cv, bestPose.rvec, bestPose.tvec);
+  const playerY = worldPose.camera[1] - 1.62;
+  const tpCommand = `/tp @s ${worldPose.camera[0].toFixed(6)} ${playerY.toFixed(6)} ${worldPose.camera[2].toFixed(6)} ${worldPose.yaw.toFixed(6)} ${worldPose.pitch.toFixed(6)}`;
+
+  return {
+    point_count: correspondences.length,
+    inlier_count: bestPose.inlierCount,
+    image_width: width,
+    image_height: height,
+    initial_vfov_deg: initialVfovDeg,
+    initial_focal_px: fInit,
+    optimized_focal_px: bestFocal,
+    optimized_hfov_deg: hfovDeg,
+    optimized_vfov_deg: vfovDeg,
+    reprojection_rmse_px: bestPose.rmse,
+    camera_position: {
+      x: worldPose.camera[0],
+      y: worldPose.camera[1],
+      z: worldPose.camera[2],
+    },
+    player_position: {
+      x: worldPose.camera[0],
+      y: playerY,
+      z: worldPose.camera[2],
+    },
+    rotation: {
+      yaw: worldPose.yaw,
+      pitch: worldPose.pitch,
+    },
+    tp_command: tpCommand,
+  };
+}
+
+async function runPoseSolve(args: McvPoseSolveArgs): Promise<McvPoseSolveResult> {
+  if (__MCV_BACKEND__ === "web") {
+    return await runWebPoseSolve(args);
+  }
+  const response = await callMcvApi<McvPoseSolveResult>({
+    op: "cv.poseSolve",
+    args,
+  });
+  if (!response.ok) {
+    throw new Error(response.error.message || "Pose solve failed");
+  }
+  return response.data;
+}
+
 async function callMcvApi<TData>(requestBody: McvRequest): Promise<McvResponse<TData>> {
   if (__MCV_BACKEND__ === "web") {
-    if (requestBody.op !== "cv.opencvTest") {
+    if (requestBody.op !== "cv.opencvTest" && requestBody.op !== "cv.poseSolve") {
       return {
         ok: false,
         error: {
@@ -1042,6 +1591,13 @@ async function callMcvApi<TData>(requestBody: McvRequest): Promise<McvResponse<T
     }
 
     try {
+      if (requestBody.op === "cv.poseSolve") {
+        const data = await runWebPoseSolve(requestBody.args as McvPoseSolveArgs);
+        return {
+          ok: true,
+          data,
+        } as McvResponse<TData>;
+      }
       const cv = await getWebMcvRuntime();
       const src = cv.matFromArray(1, 3, cv.CV_8UC3, [255, 0, 0, 0, 255, 0, 0, 0, 255]);
       const gray = new cv.Mat();
@@ -1130,6 +1686,7 @@ function installGlobalApi(): void {
     mcv: {
       call: callMcvApi,
       runImagePipeline: runImagePipeline,
+      runPoseSolve: runPoseSolve,
       backend: __MCV_BACKEND__,
     },
   };
@@ -1228,6 +1785,149 @@ function showViewerCropResult(): void {
   cropResultNode.classList.remove("hidden");
 }
 
+function removePoseSolvePanel(): void {
+  const contentNode = getViewerContentNode();
+  if (!contentNode) {
+    return;
+  }
+  const panel = contentNode.querySelector('[data-role="pose-solve-panel"]');
+  if (panel) {
+    panel.remove();
+  }
+}
+
+function resetPoseSolveState(): void {
+  poseSolveRunToken += 1;
+  poseSolveState = null;
+  removePoseSolvePanel();
+}
+
+function formatPoseNumber(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(6) : "nan";
+}
+
+function appendPoseReportRow(parent: HTMLElement, label: string, value: string): void {
+  const row = document.createElement("div");
+  row.className = "pose-report-row";
+  const keyNode = document.createElement("div");
+  keyNode.className = "pose-report-key";
+  keyNode.textContent = label;
+  const valueNode = document.createElement("div");
+  valueNode.className = "pose-report-value";
+  valueNode.textContent = value;
+  row.appendChild(keyNode);
+  row.appendChild(valueNode);
+  parent.appendChild(row);
+}
+
+function renderPoseSolvePanel(): void {
+  if (getManualInteractionMode() !== "poseSolve") {
+    removePoseSolvePanel();
+    return;
+  }
+  const contentNode = getViewerContentNode();
+  if (!contentNode) {
+    return;
+  }
+  let panel = contentNode.querySelector(
+    '[data-role="pose-solve-panel"]'
+  ) as HTMLDivElement | null;
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.setAttribute("data-role", "pose-solve-panel");
+    panel.className = "pose-report-card";
+    contentNode.appendChild(panel);
+  } else {
+    panel.replaceChildren();
+  }
+
+  const title = document.createElement("div");
+  title.className = "pose-report-title";
+  title.textContent = "PnL Pose Solve";
+  panel.appendChild(title);
+
+  if (!poseSolveState || poseSolveState.status === "idle") {
+    appendPoseReportRow(panel, "Status", "Press D in vertex solve mode to run pose solve.");
+    return;
+  }
+  if (poseSolveState.status === "running") {
+    appendPoseReportRow(panel, "Status", "Solving...");
+    return;
+  }
+  if (poseSolveState.status === "error") {
+    appendPoseReportRow(panel, "Status", "Failed");
+    appendPoseReportRow(panel, "Error", poseSolveState.error || "Pose solve failed");
+    return;
+  }
+  const result = poseSolveState.result;
+  if (!result) {
+    appendPoseReportRow(panel, "Status", "No result");
+    return;
+  }
+
+  const tpRow = document.createElement("div");
+  tpRow.className = "pose-report-tp-row";
+  const tpCode = document.createElement("code");
+  tpCode.className = "pose-report-tp-code";
+  tpCode.textContent = result.tp_command;
+  const copyButton = document.createElement("button");
+  copyButton.type = "button";
+  copyButton.className = "viewer-action-button";
+  copyButton.textContent = "Copy";
+  copyButton.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(result.tp_command);
+      copyButton.textContent = "Copied";
+    } catch {
+      copyButton.textContent = "Copy failed";
+    }
+    window.setTimeout(() => {
+      copyButton.textContent = "Copy";
+    }, 1000);
+  });
+  tpRow.appendChild(tpCode);
+  tpRow.appendChild(copyButton);
+  panel.appendChild(tpRow);
+
+  appendPoseReportRow(
+    panel,
+    "Points",
+    `${result.point_count} (inliers: ${result.inlier_count})`
+  );
+  appendPoseReportRow(panel, "Image", `${result.image_width}x${result.image_height}`);
+  appendPoseReportRow(
+    panel,
+    "Initial guess",
+    `vfov=${formatPoseNumber(result.initial_vfov_deg)} deg, focal=${formatPoseNumber(result.initial_focal_px)} px`
+  );
+  appendPoseReportRow(panel, "Optimized focal", `${formatPoseNumber(result.optimized_focal_px)} px`);
+  appendPoseReportRow(
+    panel,
+    "Optimized FOV",
+    `h=${formatPoseNumber(result.optimized_hfov_deg)} deg, v=${formatPoseNumber(result.optimized_vfov_deg)} deg`
+  );
+  appendPoseReportRow(
+    panel,
+    "Reprojection RMSE",
+    `${formatPoseNumber(result.reprojection_rmse_px)} px`
+  );
+  appendPoseReportRow(
+    panel,
+    "Camera position",
+    `${formatPoseNumber(result.camera_position.x)}, ${formatPoseNumber(result.camera_position.y)}, ${formatPoseNumber(result.camera_position.z)}`
+  );
+  appendPoseReportRow(
+    panel,
+    "Player position",
+    `${formatPoseNumber(result.player_position.x)}, ${formatPoseNumber(result.player_position.y)}, ${formatPoseNumber(result.player_position.z)}`
+  );
+  appendPoseReportRow(
+    panel,
+    "Rotation (yaw, pitch)",
+    `${formatPoseNumber(result.rotation.yaw)}, ${formatPoseNumber(result.rotation.pitch)}`
+  );
+}
+
 function updateViewerCursor(): void {
   const cropResultNode = getViewerCropResultNode();
   if (!cropResultNode) {
@@ -1323,6 +2023,7 @@ function clearViewerFullImage(): void {
   cropResultCache = null;
   resetCropInteractionState();
   hideViewerCropResult();
+  removePoseSolvePanel();
 }
 
 function scrollViewerFullImageIntoView(): void {
@@ -1550,6 +2251,20 @@ function getAxisLightColor(axis: ManualAxis): string {
   return "#9ec7ff";
 }
 
+function formatVertexSolveCoordValue(value: number | undefined): string {
+  if (value === undefined) {
+    return "?";
+  }
+  if (Number.isInteger(value)) {
+    return String(value);
+  }
+  return value.toFixed(3).replace(/\.?0+$/, "");
+}
+
+function formatVertexSolveCoordTuple(coord: VertexSolveCoord): string {
+  return `(${formatVertexSolveCoordValue(coord.x)}, ${formatVertexSolveCoordValue(coord.y)}, ${formatVertexSolveCoordValue(coord.z)})`;
+}
+
 function getManualInteractionMode(): ManualInteractionMode {
   return manualInteractionMode;
 }
@@ -1558,8 +2273,14 @@ function setManualInteractionMode(mode: ManualInteractionMode): void {
   if (manualInteractionMode === mode) {
     return;
   }
-  if (manualInteractionMode === "vertexSolve" && mode !== "vertexSolve") {
+  const leavingSolveMode =
+    manualInteractionMode === "vertexSolve" || manualInteractionMode === "poseSolve";
+  const enteringSolveMode = mode === "vertexSolve" || mode === "poseSolve";
+  if (leavingSolveMode && !enteringSolveMode) {
     purgeGeneratedVerticesKeepingAnchors();
+  }
+  if (manualInteractionMode === "poseSolve" && mode !== "poseSolve") {
+    resetPoseSolveState();
   }
   manualInteractionMode = mode;
   if (mode === "anchor") {
@@ -1568,6 +2289,7 @@ function setManualInteractionMode(mode: ManualInteractionMode): void {
     manualEditHoveredLineIndex = null;
     manualEditSelectedLineIndex = null;
     vertexSolveRenderData = null;
+    vertexSolveHoveredVertexIndex = null;
   } else if (mode === "edit") {
     manualDraftLine = null;
     manualDragPointerId = null;
@@ -1575,7 +2297,9 @@ function setManualInteractionMode(mode: ManualInteractionMode): void {
     manualAnchorSelectedIndex = null;
     manualAnchorSelectedInput = "";
     vertexSolveRenderData = null;
+    vertexSolveHoveredVertexIndex = null;
   } else if (mode === "vertexSolve") {
+    resetPoseSolveState();
     manualDraftLine = null;
     manualDragPointerId = null;
     manualAnchorHoveredVertex = null;
@@ -1584,6 +2308,19 @@ function setManualInteractionMode(mode: ManualInteractionMode): void {
     manualEditHoveredLineIndex = null;
     manualEditSelectedLineIndex = null;
     vertexSolveRenderData = runVertexSolveAndBuildData();
+    vertexSolveHoveredVertexIndex = null;
+  } else if (mode === "poseSolve") {
+    manualDraftLine = null;
+    manualDragPointerId = null;
+    manualAnchorHoveredVertex = null;
+    manualAnchorSelectedIndex = null;
+    manualAnchorSelectedInput = "";
+    manualEditHoveredLineIndex = null;
+    manualEditSelectedLineIndex = null;
+    if (!vertexSolveRenderData) {
+      vertexSolveRenderData = runVertexSolveAndBuildData();
+    }
+    vertexSolveHoveredVertexIndex = null;
   } else {
     manualAnchorHoveredVertex = null;
     manualAnchorSelectedIndex = null;
@@ -1591,6 +2328,92 @@ function setManualInteractionMode(mode: ManualInteractionMode): void {
     manualEditHoveredLineIndex = null;
     manualEditSelectedLineIndex = null;
     vertexSolveRenderData = null;
+    vertexSolveHoveredVertexIndex = null;
+  }
+  renderCropResultFromCache();
+}
+
+function buildPoseSolveArgsFromCurrentStructure(): McvPoseSolveArgs | null {
+  if (!cropResultCache) {
+    return null;
+  }
+  return {
+    width: cropResultCache.width,
+    height: cropResultCache.height,
+    lines: MCV_DATA.structure.lines.map((line) => ({
+      from: {
+        x: line.from.x,
+        y: line.from.y,
+        from: [...line.from.from],
+        to: [...line.from.to],
+        ...(line.from.anchor !== undefined ? { anchor: line.from.anchor } : {}),
+        ...(line.from.vertex !== undefined ? { vertex: line.from.vertex } : {}),
+      },
+      to: {
+        x: line.to.x,
+        y: line.to.y,
+        from: [...line.to.from],
+        to: [...line.to.to],
+        ...(line.to.anchor !== undefined ? { anchor: line.to.anchor } : {}),
+        ...(line.to.vertex !== undefined ? { vertex: line.to.vertex } : {}),
+      },
+      axis: line.axis,
+      ...(line.length !== undefined ? { length: line.length } : {}),
+    })),
+    vertices: MCV_DATA.structure.vertices.map((vertex) => ({
+      from: [...vertex.from],
+      to: [...vertex.to],
+      ...(vertex.anchor !== undefined ? { anchor: vertex.anchor } : {}),
+      ...(vertex.x !== undefined ? { x: vertex.x } : {}),
+      ...(vertex.y !== undefined ? { y: vertex.y } : {}),
+      ...(vertex.z !== undefined ? { z: vertex.z } : {}),
+    })),
+  };
+}
+
+async function runPoseSolveFromCurrentStructure(): Promise<void> {
+  if (getManualInteractionMode() !== "poseSolve") {
+    return;
+  }
+  const args = buildPoseSolveArgsFromCurrentStructure();
+  if (!args) {
+    poseSolveState = {
+      status: "error",
+      error: "No image is loaded",
+    };
+    renderCropResultFromCache();
+    return;
+  }
+  const correspondences = buildPoseCorrespondencesFromStructure(args.lines, args.vertices);
+  if (correspondences.length < 4) {
+    poseSolveState = {
+      status: "error",
+      error: "Need at least 4 solved structure vertices with world coordinates (x, y, z)",
+    };
+    renderCropResultFromCache();
+    return;
+  }
+
+  const token = ++poseSolveRunToken;
+  poseSolveState = { status: "running" };
+  renderCropResultFromCache();
+  try {
+    const result = await runPoseSolve(args);
+    if (token !== poseSolveRunToken || getManualInteractionMode() !== "poseSolve") {
+      return;
+    }
+    poseSolveState = {
+      status: "done",
+      result,
+    };
+  } catch (error) {
+    if (token !== poseSolveRunToken || getManualInteractionMode() !== "poseSolve") {
+      return;
+    }
+    poseSolveState = {
+      status: "error",
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
   renderCropResultFromCache();
 }
@@ -2140,6 +2963,7 @@ function runVertexSolveAndBuildData(): VertexSolveRenderData {
   const anchorVertexIndexes = new Set<number>();
   const traversedLineIndexes = new Set<number>();
   let conflictVertexIndex: number | null = null;
+  let conflictCoordPair: { existing: VertexSolveCoord; inferred: VertexSolveCoord } | null = null;
 
   const anchorToTopologyIndex: number[] = [];
   MCV_DATA.structure.anchors.forEach((anchor, anchorIndex) => {
@@ -2151,6 +2975,10 @@ function runVertexSolveAndBuildData(): VertexSolveRenderData {
       const merge = mergeCoordIntoTarget(coords[topoIndex], getAnchorSeedCoord(anchor));
       if (merge === "conflict" && conflictVertexIndex === null) {
         conflictVertexIndex = topoIndex;
+        conflictCoordPair = {
+          existing: { ...coords[topoIndex] },
+          inferred: { ...getAnchorSeedCoord(anchor) },
+        };
       }
       if (hasAnyCoord(coords[topoIndex]) && !inQueue.has(topoIndex)) {
         queue.push(topoIndex);
@@ -2173,6 +3001,10 @@ function runVertexSolveAndBuildData(): VertexSolveRenderData {
       const merge = mergeCoordIntoTarget(coords[nextVertex], inferred);
       if (merge === "conflict") {
         conflictVertexIndex = nextVertex;
+        conflictCoordPair = {
+          existing: { ...coords[nextVertex] },
+          inferred: { ...inferred },
+        };
         break;
       }
       if (merge === "updated" && !inQueue.has(nextVertex)) {
@@ -2239,6 +3071,8 @@ function runVertexSolveAndBuildData(): VertexSolveRenderData {
     generatedVertexIndexes,
     anchorVertexIndexes,
     conflictVertexIndex,
+    conflictCoordPair,
+    topologyCoords: coords.map((coord) => ({ ...coord })),
     topologyVertices,
   };
 }
@@ -2294,6 +3128,38 @@ function updateEditHoverFromClient(clientX: number, clientY: number): void {
   const nextValue = next >= 0 ? next : null;
   if (manualEditHoveredLineIndex !== nextValue) {
     manualEditHoveredLineIndex = nextValue;
+    renderCropResultFromCache();
+  }
+}
+
+function updateVertexSolveHoverFromClient(clientX: number, clientY: number): void {
+  if (!cropResultCache || getManualInteractionMode() !== "vertexSolve") {
+    if (vertexSolveHoveredVertexIndex !== null) {
+      vertexSolveHoveredVertexIndex = null;
+      renderCropResultFromCache();
+    }
+    return;
+  }
+  const solveData = vertexSolveRenderData ?? (vertexSolveRenderData = runVertexSolveAndBuildData());
+  const point = getCropPointFromClient(clientX, clientY, cropResultCache.width, cropResultCache.height);
+  if (!point || !solveData || solveData.topologyVertices.length === 0) {
+    if (vertexSolveHoveredVertexIndex !== null) {
+      vertexSolveHoveredVertexIndex = null;
+      renderCropResultFromCache();
+    }
+    return;
+  }
+  let bestIndex: number | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  solveData.topologyVertices.forEach((vertex, index) => {
+    const distance = Math.hypot(vertex.point.x - point.x, vertex.point.y - point.y);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+  if (vertexSolveHoveredVertexIndex !== bestIndex) {
+    vertexSolveHoveredVertexIndex = bestIndex;
     renderCropResultFromCache();
   }
 }
@@ -2693,6 +3559,24 @@ function createManualModeCropResultSvg(
         appendSvgPointDot(sceneGroup, conflict.point, "#ff4d4d", 3.2);
       }
     }
+    if (
+      vertexSolveHoveredVertexIndex !== null &&
+      vertexSolveHoveredVertexIndex >= 0 &&
+      vertexSolveHoveredVertexIndex < solveData.topologyVertices.length
+    ) {
+      const hoveredPoint = solveData.topologyVertices[vertexSolveHoveredVertexIndex].point;
+      let labelText = formatVertexSolveCoordTuple(
+        solveData.topologyCoords[vertexSolveHoveredVertexIndex] ?? {}
+      );
+      if (
+        solveData.conflictVertexIndex !== null &&
+        vertexSolveHoveredVertexIndex === solveData.conflictVertexIndex &&
+        solveData.conflictCoordPair
+      ) {
+        labelText = `${formatVertexSolveCoordTuple(solveData.conflictCoordPair.existing)} vs ${formatVertexSolveCoordTuple(solveData.conflictCoordPair.inferred)}`;
+      }
+      appendSvgAnchorLabel(sceneGroup, hoveredPoint, labelText, "#ffe46b");
+    }
   }
 
   svg.addEventListener("pointerdown", (event) => {
@@ -2837,8 +3721,25 @@ function sizeCropResultElement(
 }
 
 function renderCropResultFromCache(): void {
+  const imageStage = getViewerFullImageStageNode();
   if (!cropResultCache) {
+    removePoseSolvePanel();
+    if (imageStage) {
+      imageStage.classList.add("hidden");
+    }
     return;
+  }
+  if (getManualInteractionMode() === "poseSolve") {
+    hideViewerCropResult();
+    if (imageStage) {
+      imageStage.classList.add("hidden");
+    }
+    renderPoseSolvePanel();
+    return;
+  }
+  removePoseSolvePanel();
+  if (imageStage) {
+    imageStage.classList.remove("hidden");
   }
   const cropResultNode = getViewerCropResultNode();
   if (!cropResultNode) {
@@ -2893,6 +3794,10 @@ function updateManualDraftFromPointer(pointer: PointerEvent): void {
     return;
   }
   if (getManualInteractionMode() === "vertexSolve") {
+    updateVertexSolveHoverFromClient(pointer.clientX, pointer.clientY);
+    return;
+  }
+  if (getManualInteractionMode() === "poseSolve") {
     return;
   }
 
@@ -3941,6 +4846,8 @@ function applyImportedMcvState(data: {
   manualEditHoveredLineIndex = null;
   manualEditSelectedLineIndex = null;
   vertexSolveRenderData = null;
+  poseSolveState = null;
+  poseSolveRunToken += 1;
   renderAnnotationPreviewHeld = false;
   clearAnnotationsDirty();
 }
@@ -4826,6 +5733,23 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       setManualInteractionMode("vertexSolve");
       return;
     }
+    if (event.key === "d" || event.key === "D") {
+      if (
+        getManualInteractionMode() === "vertexSolve" &&
+        vertexSolveRenderData &&
+        vertexSolveRenderData.conflictVertexIndex === null
+      ) {
+        event.preventDefault();
+        setManualInteractionMode("poseSolve");
+        void runPoseSolveFromCurrentStructure();
+        return;
+      }
+      if (getManualInteractionMode() === "poseSolve") {
+        event.preventDefault();
+        void runPoseSolveFromCurrentStructure();
+        return;
+      }
+    }
     if (
       (event.key === "4" || event.code === "Numpad4") &&
       !(getManualInteractionMode() === "anchor" && manualAnchorSelectedIndex !== null)
@@ -4842,6 +5766,8 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       } else if (getManualInteractionMode() === "edit") {
         manualEditSelectedLineIndex = null;
       } else if (getManualInteractionMode() === "vertexSolve") {
+        // keep solve view active until explicit mode change
+      } else if (getManualInteractionMode() === "poseSolve") {
         // keep solve view active until explicit mode change
       } else if (manualDraftLine) {
         manualDraftLine = null;
@@ -4875,7 +5801,8 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       if (
         getManualInteractionMode() === "anchor" ||
         getManualInteractionMode() === "edit" ||
-        getManualInteractionMode() === "vertexSolve"
+        getManualInteractionMode() === "vertexSolve" ||
+        getManualInteractionMode() === "poseSolve"
       ) {
         return;
       }
@@ -4896,7 +5823,8 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       if (
         getManualInteractionMode() === "anchor" ||
         getManualInteractionMode() === "edit" ||
-        getManualInteractionMode() === "vertexSolve"
+        getManualInteractionMode() === "vertexSolve" ||
+        getManualInteractionMode() === "poseSolve"
       ) {
         return;
       }
@@ -4912,7 +5840,8 @@ function handleViewerKeybind(event: KeyboardEvent): void {
     if (event.key === "ArrowUp" || event.key === "=" || event.key === "+") {
       if (
         getManualInteractionMode() === "anchor" ||
-        getManualInteractionMode() === "vertexSolve"
+        getManualInteractionMode() === "vertexSolve" ||
+        getManualInteractionMode() === "poseSolve"
       ) {
         return;
       }
@@ -4927,7 +5856,8 @@ function handleViewerKeybind(event: KeyboardEvent): void {
     if (event.key === "ArrowDown" || event.key === "-" || event.key === "_") {
       if (
         getManualInteractionMode() === "anchor" ||
-        getManualInteractionMode() === "vertexSolve"
+        getManualInteractionMode() === "vertexSolve" ||
+        getManualInteractionMode() === "poseSolve"
       ) {
         return;
       }
@@ -4952,6 +5882,12 @@ function handleViewerKeybind(event: KeyboardEvent): void {
         return;
       }
       if (getManualInteractionMode() === "vertexSolve") {
+        setManualInteractionMode("draw");
+        manualAxisSelection = axis;
+        manualAxisStartsBackwards = startsBackwards;
+        return;
+      }
+      if (getManualInteractionMode() === "poseSolve") {
         setManualInteractionMode("draw");
         manualAxisSelection = axis;
         manualAxisStartsBackwards = startsBackwards;

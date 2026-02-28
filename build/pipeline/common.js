@@ -102,6 +102,7 @@ import sys
 from pathlib import Path
 import base64
 import time
+import math
 
 REQUIREMENTS_FILENAME = "mcv-requirements.txt"
 REQUIREMENTS_TEXT = ${requirementsAsPythonString}
@@ -206,6 +207,260 @@ def run_pipeline(args):
     }
 
 
+def _is_finite_number(value):
+    return isinstance(value, (int, float)) and np.isfinite(float(value))
+
+
+def _extract_pose_correspondences(lines, vertices):
+    if not isinstance(lines, list) or not isinstance(vertices, list):
+        raise ValueError("lines and vertices must be arrays")
+    out_rows = []
+    max_line_index = len(lines) - 1
+    for vertex in vertices:
+        if not isinstance(vertex, dict):
+            continue
+        vx = vertex.get("x")
+        vy = vertex.get("y")
+        vz = vertex.get("z")
+        if not (_is_finite_number(vx) and _is_finite_number(vy) and _is_finite_number(vz)):
+            continue
+        endpoint_ids = set()
+        from_refs = vertex.get("from")
+        to_refs = vertex.get("to")
+        if isinstance(from_refs, list):
+            for line_index in from_refs:
+                if isinstance(line_index, int) and 0 <= line_index <= max_line_index:
+                    endpoint_ids.add(line_index * 2)
+        if isinstance(to_refs, list):
+            for line_index in to_refs:
+                if isinstance(line_index, int) and 0 <= line_index <= max_line_index:
+                    endpoint_ids.add(line_index * 2 + 1)
+        if not endpoint_ids:
+            continue
+        sum_x = 0.0
+        sum_y = 0.0
+        count = 0
+        for endpoint_id in endpoint_ids:
+            line_index = endpoint_id // 2
+            endpoint_key = "from" if endpoint_id % 2 == 0 else "to"
+            line = lines[line_index] if 0 <= line_index < len(lines) else None
+            if not isinstance(line, dict):
+                continue
+            endpoint = line.get(endpoint_key)
+            if not isinstance(endpoint, dict):
+                continue
+            px = endpoint.get("x")
+            py = endpoint.get("y")
+            if not (_is_finite_number(px) and _is_finite_number(py)):
+                continue
+            sum_x += float(px)
+            sum_y += float(py)
+            count += 1
+        if count <= 0:
+            continue
+        out_rows.append((sum_x / count, sum_y / count, float(vx), float(vy), float(vz)))
+    if len(out_rows) < 4:
+        raise ValueError("Need at least 4 valid vertex correspondences with known world coordinates")
+    data = np.array(out_rows, dtype=np.float64)
+    image_pts = data[:, 0:2].astype(np.float64)
+    object_pts = data[:, 2:5].astype(np.float64)
+    return image_pts, object_pts
+
+
+def _camera_matrix_from_focal(focal, width, height):
+    cx = (width - 1) * 0.5
+    cy = (height - 1) * 0.5
+    return np.array(
+        [[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _solve_pose_for_focal(object_pts, image_pts, width, height, focal):
+    k = _camera_matrix_from_focal(focal, width, height)
+    dist = np.zeros((4, 1), dtype=np.float64)
+    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+        object_pts,
+        image_pts,
+        k,
+        dist,
+        flags=cv2.SOLVEPNP_EPNP,
+        reprojectionError=4.0,
+        confidence=0.999,
+        iterationsCount=800,
+    )
+    if not ok:
+        return float("inf"), np.zeros((3, 1), dtype=np.float64), np.zeros((3, 1), dtype=np.float64), np.array([], dtype=np.int32), float("inf")
+
+    if inliers is None or len(inliers) < 4:
+        inlier_idx = np.arange(object_pts.shape[0], dtype=np.int32)
+    else:
+        inlier_idx = inliers.reshape(-1).astype(np.int32)
+
+    obj_in = object_pts[inlier_idx]
+    img_in = image_pts[inlier_idx]
+    ok_refine, rvec, tvec = cv2.solvePnP(
+        obj_in,
+        img_in,
+        k,
+        dist,
+        rvec=rvec,
+        tvec=tvec,
+        useExtrinsicGuess=True,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok_refine:
+        return float("inf"), np.zeros((3, 1), dtype=np.float64), np.zeros((3, 1), dtype=np.float64), inlier_idx, float("inf")
+
+    if hasattr(cv2, "solvePnPRefineLM"):
+        try:
+            rvec, tvec = cv2.solvePnPRefineLM(obj_in, img_in, k, dist, rvec, tvec)
+        except cv2.error:
+            pass
+
+    proj, _ = cv2.projectPoints(object_pts, rvec, tvec, k, dist)
+    proj = proj.reshape(-1, 2)
+    err = np.linalg.norm(proj - image_pts, axis=1)
+    rmse = float(np.sqrt(np.mean(err**2)))
+    delta = 5.0
+    huber = np.where(err <= delta, 0.5 * (err**2), delta * (err - 0.5 * delta))
+    outlier_penalty = (object_pts.shape[0] - len(inlier_idx)) * (delta**2)
+    cost = float(np.mean(huber) + outlier_penalty)
+    return cost, rvec, tvec, inlier_idx, rmse
+
+
+def _golden_section_search(fn, lo, hi, iterations=48):
+    phi = (1.0 + np.sqrt(5.0)) * 0.5
+    inv_phi = 1.0 / phi
+    x1 = hi - (hi - lo) * inv_phi
+    x2 = lo + (hi - lo) * inv_phi
+    f1 = fn(x1)
+    f2 = fn(x2)
+    for _ in range(iterations):
+        if f1 < f2:
+            hi = x2
+            x2 = x1
+            f2 = f1
+            x1 = hi - (hi - lo) * inv_phi
+            f1 = fn(x1)
+        else:
+            lo = x1
+            x1 = x2
+            f1 = f2
+            x2 = lo + (hi - lo) * inv_phi
+            f2 = fn(x2)
+    return (x1, f1) if f1 < f2 else (x2, f2)
+
+
+def _wrap_degrees(angle_deg):
+    return ((angle_deg + 180.0) % 360.0) - 180.0
+
+
+def _pose_to_camera_world_and_minecraft_angles(rvec, tvec):
+    rmat, _ = cv2.Rodrigues(rvec)
+    cam_world = -(rmat.T @ tvec).reshape(3)
+    forward_world = rmat.T @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    n = float(np.linalg.norm(forward_world))
+    if n > 1e-12:
+        forward_world = forward_world / n
+    pitch = float(np.degrees(np.arcsin(np.clip(-forward_world[1], -1.0, 1.0))))
+    yaw = float(np.degrees(np.arctan2(-forward_world[0], forward_world[2])))
+    yaw = _wrap_degrees(yaw)
+    return cam_world, pitch, yaw
+
+
+def run_pose_solve(args):
+    width_raw = args.get("width")
+    height_raw = args.get("height")
+    if not isinstance(width_raw, (int, float)) or not isinstance(height_raw, (int, float)):
+        raise ValueError("width and height are required")
+    width = int(width_raw)
+    height = int(height_raw)
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive")
+
+    lines = args.get("lines")
+    vertices = args.get("vertices")
+    image_pts, object_pts = _extract_pose_correspondences(lines, vertices)
+
+    initial_vfov_raw = args.get("initial_vfov_deg")
+    initial_vfov_deg = (
+        float(initial_vfov_raw)
+        if isinstance(initial_vfov_raw, (int, float)) and np.isfinite(float(initial_vfov_raw))
+        else 70.0
+    )
+    if not (1.0 < initial_vfov_deg < 179.0):
+        initial_vfov_deg = 70.0
+    f_init = (height * 0.5) / np.tan(np.deg2rad(initial_vfov_deg * 0.5))
+    f_min = max(20.0, f_init * 0.30)
+    f_max = f_init * 3.00
+
+    cache = {}
+
+    def eval_logf(logf):
+        key = float(logf)
+        if key not in cache:
+            focal = float(np.exp(logf))
+            cache[key] = _solve_pose_for_focal(object_pts, image_pts, width, height, focal)
+        return cache[key][0]
+
+    logs = np.linspace(np.log(f_min), np.log(f_max), 44)
+    costs = np.array([eval_logf(float(l)) for l in logs], dtype=np.float64)
+    best_idx = int(np.argmin(costs))
+    lo_idx = max(0, best_idx - 2)
+    hi_idx = min(len(logs) - 1, best_idx + 2)
+    lo = float(logs[lo_idx])
+    hi = float(logs[hi_idx])
+    if hi <= lo:
+        lo = float(logs[0])
+        hi = float(logs[-1])
+
+    best_logf, _ = _golden_section_search(eval_logf, lo, hi, iterations=32)
+    best_f = float(np.exp(best_logf))
+    best_cost, best_rvec, best_tvec, best_inliers, rmse = _solve_pose_for_focal(
+        object_pts, image_pts, width, height, best_f
+    )
+    if not np.isfinite(best_cost):
+        raise RuntimeError("Focal search failed to find a valid PnP solution")
+
+    cam_world, pitch_deg, yaw_deg = _pose_to_camera_world_and_minecraft_angles(best_rvec, best_tvec)
+    player_y = float(cam_world[1] - 1.62)
+    hfov_deg = float(np.degrees(2.0 * np.arctan((width * 0.5) / best_f)))
+    vfov_deg = float(np.degrees(2.0 * np.arctan((height * 0.5) / best_f)))
+    tp_command = (
+        f"/tp @s {cam_world[0]:.6f} {player_y:.6f} {cam_world[2]:.6f} "
+        f"{yaw_deg:.6f} {pitch_deg:.6f}"
+    )
+
+    return {
+        "point_count": int(len(object_pts)),
+        "inlier_count": int(len(best_inliers)),
+        "image_width": int(width),
+        "image_height": int(height),
+        "initial_vfov_deg": float(initial_vfov_deg),
+        "initial_focal_px": float(f_init),
+        "optimized_focal_px": float(best_f),
+        "optimized_hfov_deg": float(hfov_deg),
+        "optimized_vfov_deg": float(vfov_deg),
+        "reprojection_rmse_px": float(rmse),
+        "camera_position": {
+            "x": float(cam_world[0]),
+            "y": float(cam_world[1]),
+            "z": float(cam_world[2]),
+        },
+        "player_position": {
+            "x": float(cam_world[0]),
+            "y": float(player_y),
+            "z": float(cam_world[2]),
+        },
+        "rotation": {
+            "yaw": float(yaw_deg),
+            "pitch": float(pitch_deg),
+        },
+        "tp_command": tp_command,
+    }
+
+
 def handle_mcv_cv_opencv_test(_args):
     rgb = np.array([[[255, 0, 0], [0, 255, 0], [0, 0, 255]]], dtype=np.uint8)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -234,6 +489,22 @@ def api_mcv():
 
     if op == "cv.opencvTest":
         return jsonify({"ok": True, "data": handle_mcv_cv_opencv_test(args)})
+    if op == "cv.poseSolve":
+        try:
+            return jsonify({"ok": True, "data": run_pose_solve(args)})
+        except Exception as exc:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "POSE_SOLVE_ERROR",
+                            "message": str(exc),
+                        },
+                    }
+                ),
+                400,
+            )
 
     return (
         jsonify(

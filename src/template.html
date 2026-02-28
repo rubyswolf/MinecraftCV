@@ -339,6 +339,51 @@ __MCV_BODY_STYLE__
       color: var(--muted);
       font-size: 0.9rem;
     }
+    .pose-report-card {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #121b24;
+      padding: 12px;
+    }
+    .pose-report-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .pose-report-tp-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .pose-report-tp-code {
+      display: block;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0f151c;
+      padding: 8px 10px;
+      font-family: Consolas, "Courier New", monospace;
+      color: #d8f3e8;
+      word-break: break-all;
+      flex: 1 1 360px;
+    }
+    .pose-report-row {
+      display: grid;
+      grid-template-columns: minmax(140px, 220px) 1fr;
+      gap: 10px;
+      align-items: baseline;
+    }
+    .pose-report-key {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .pose-report-value {
+      color: var(--text);
+      font-size: 0.92rem;
+      word-break: break-word;
+    }
   </style>
 </head>
 <body>
