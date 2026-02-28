@@ -86,11 +86,23 @@ type DraftManualLine = {
   flipped: boolean;
   length?: number;
 };
-type ManualInteractionMode = "draw" | "anchor" | "edit";
+type ManualInteractionMode = "draw" | "anchor" | "edit" | "vertexSolve";
 type StructureVertex = {
   endpointIds: number[];
   point: ManualPoint;
   lineIndexes: number[];
+};
+type VertexSolveRenderData = {
+  traversedLineIndexes: Set<number>;
+  generatedVertexIndexes: Set<number>;
+  anchorVertexIndexes: Set<number>;
+  conflictVertexIndex: number | null;
+  topologyVertices: StructureVertex[];
+};
+type VertexSolveCoord = {
+  x?: number;
+  y?: number;
+  z?: number;
 };
 
 type McvImagePipelineResult = {
@@ -234,6 +246,7 @@ let manualAnchorSelectedInput = "";
 let manualAnchorHoveredVertex: StructureVertex | null = null;
 let manualEditHoveredLineIndex: number | null = null;
 let manualEditSelectedLineIndex: number | null = null;
+let vertexSolveRenderData: VertexSolveRenderData | null = null;
 let viewerCtrlHeld = false;
 let renderAnnotationPreviewHeld = false;
 let viewerMotionRafId: number | null = null;
@@ -738,6 +751,7 @@ function resetCropInteractionState(): void {
   manualAnchorHoveredVertex = null;
   manualEditHoveredLineIndex = null;
   manualEditSelectedLineIndex = null;
+  vertexSolveRenderData = null;
   manualAxisStartsBackwards = false;
   renderAnnotationPreviewHeld = false;
 }
@@ -1467,24 +1481,39 @@ function setManualInteractionMode(mode: ManualInteractionMode): void {
   if (manualInteractionMode === mode) {
     return;
   }
+  if (manualInteractionMode === "vertexSolve" && mode !== "vertexSolve") {
+    purgeGeneratedVerticesKeepingAnchors();
+  }
   manualInteractionMode = mode;
   if (mode === "anchor") {
     manualDraftLine = null;
     manualDragPointerId = null;
     manualEditHoveredLineIndex = null;
     manualEditSelectedLineIndex = null;
+    vertexSolveRenderData = null;
   } else if (mode === "edit") {
     manualDraftLine = null;
     manualDragPointerId = null;
     manualAnchorHoveredVertex = null;
     manualAnchorSelectedIndex = null;
     manualAnchorSelectedInput = "";
+    vertexSolveRenderData = null;
+  } else if (mode === "vertexSolve") {
+    manualDraftLine = null;
+    manualDragPointerId = null;
+    manualAnchorHoveredVertex = null;
+    manualAnchorSelectedIndex = null;
+    manualAnchorSelectedInput = "";
+    manualEditHoveredLineIndex = null;
+    manualEditSelectedLineIndex = null;
+    vertexSolveRenderData = runVertexSolveAndBuildData();
   } else {
     manualAnchorHoveredVertex = null;
     manualAnchorSelectedIndex = null;
     manualAnchorSelectedInput = "";
     manualEditHoveredLineIndex = null;
     manualEditSelectedLineIndex = null;
+    vertexSolveRenderData = null;
   }
   renderCropResultFromCache();
 }
@@ -1861,6 +1890,281 @@ function findNearestStructureVertex(point: ManualPoint): StructureVertex | null 
   return best;
 }
 
+function purgeGeneratedVerticesKeepingAnchors(): void {
+  const retainedVertices: StructureVertexData[] = [];
+  MCV_DATA.structure.anchors.forEach((anchor, anchorIndex) => {
+    const vertex = MCV_DATA.structure.vertices[anchor.vertex];
+    if (vertex) {
+      retainedVertices.push({
+        ...vertex,
+        from: normalizeLineRefs(vertex.from),
+        to: normalizeLineRefs(vertex.to),
+        anchor: anchorIndex,
+      });
+    } else {
+      retainedVertices.push({
+        from: normalizeLineRefs(anchor.from),
+        to: normalizeLineRefs(anchor.to),
+        ...(anchor.x !== undefined ? { x: anchor.x } : {}),
+        ...(anchor.y !== undefined ? { y: anchor.y } : {}),
+        ...(anchor.z !== undefined ? { z: anchor.z } : {}),
+        anchor: anchorIndex,
+      });
+    }
+    anchor.vertex = retainedVertices.length - 1;
+  });
+  MCV_DATA.structure.vertices = retainedVertices;
+  syncStructureEndpointRefs();
+}
+
+function getAnchorSeedCoord(anchor: StructureAnchor): VertexSolveCoord {
+  const coord: VertexSolveCoord = {};
+  if (anchor.x !== undefined) {
+    coord.x = anchor.x;
+  }
+  if (anchor.y !== undefined) {
+    coord.y = anchor.y;
+  }
+  if (anchor.z !== undefined) {
+    coord.z = anchor.z;
+  }
+  return coord;
+}
+
+function hasAnyCoord(coord: VertexSolveCoord): boolean {
+  return coord.x !== undefined || coord.y !== undefined || coord.z !== undefined;
+}
+
+function mergeCoordIntoTarget(target: VertexSolveCoord, next: VertexSolveCoord): "none" | "updated" | "conflict" {
+  let changed = false;
+  const mergeAxis = (key: keyof VertexSolveCoord) => {
+    const value = next[key];
+    if (value === undefined) {
+      return;
+    }
+    const current = target[key];
+    if (current === undefined) {
+      target[key] = value;
+      changed = true;
+      return;
+    }
+    if (current !== value) {
+      changed = false;
+      throw new Error("conflict");
+    }
+  };
+  try {
+    mergeAxis("x");
+    mergeAxis("y");
+    mergeAxis("z");
+  } catch {
+    return "conflict";
+  }
+  return changed ? "updated" : "none";
+}
+
+function findTopologyVertexIndexForAnchor(
+  anchor: StructureAnchor,
+  topologyVertices: StructureVertex[]
+): number {
+  const endpointIds = getAnchorEndpointIds(anchor);
+  if (endpointIds.length === 0) {
+    return -1;
+  }
+  for (let index = 0; index < topologyVertices.length; index += 1) {
+    if (areSortedArraysEqual(endpointIds, topologyVertices[index].endpointIds)) {
+      return index;
+    }
+  }
+  for (let index = 0; index < topologyVertices.length; index += 1) {
+    const ids = topologyVertices[index].endpointIds;
+    if (endpointIds.every((id) => ids.includes(id))) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function inferNeighborCoord(
+  current: VertexSolveCoord,
+  axis: ManualAxis,
+  length: number,
+  forward: boolean
+): VertexSolveCoord {
+  const sign = forward ? 1 : -1;
+  const next: VertexSolveCoord = {};
+  if (current.x !== undefined) {
+    next.x = axis === "x" ? current.x + sign * length : current.x;
+  }
+  if (current.y !== undefined) {
+    next.y = axis === "y" ? current.y + sign * length : current.y;
+  }
+  if (current.z !== undefined) {
+    next.z = axis === "z" ? current.z + sign * length : current.z;
+  }
+  return next;
+}
+
+function runVertexSolveAndBuildData(): VertexSolveRenderData {
+  const topologyVertices = collectStructureVertices();
+  const endpointToVertex = new Map<number, number>();
+  topologyVertices.forEach((vertex, vertexIndex) => {
+    vertex.endpointIds.forEach((endpointId) => {
+      endpointToVertex.set(endpointId, vertexIndex);
+    });
+  });
+
+  const lineEdges: Array<{
+    lineIndex: number;
+    fromVertex: number;
+    toVertex: number;
+    axis: ManualAxis;
+    length: number;
+  }> = [];
+  MCV_DATA.structure.lines.forEach((line, lineIndex) => {
+    if (line.length === undefined || line.length <= 0) {
+      return;
+    }
+    const fromVertex = endpointToVertex.get(lineIndex * 2);
+    const toVertex = endpointToVertex.get(lineIndex * 2 + 1);
+    if (fromVertex === undefined || toVertex === undefined || fromVertex === toVertex) {
+      return;
+    }
+    lineEdges.push({
+      lineIndex,
+      fromVertex,
+      toVertex,
+      axis: line.axis,
+      length: line.length,
+    });
+  });
+
+  const adjacency = new Map<number, Array<(typeof lineEdges)[number]>>();
+  lineEdges.forEach((edge) => {
+    const fromList = adjacency.get(edge.fromVertex);
+    if (fromList) {
+      fromList.push(edge);
+    } else {
+      adjacency.set(edge.fromVertex, [edge]);
+    }
+    const toList = adjacency.get(edge.toVertex);
+    if (toList) {
+      toList.push(edge);
+    } else {
+      adjacency.set(edge.toVertex, [edge]);
+    }
+  });
+
+  const coords: VertexSolveCoord[] = Array.from({ length: topologyVertices.length }, () => ({}));
+  const queue: number[] = [];
+  const inQueue = new Set<number>();
+  const generatedVertexIndexes = new Set<number>();
+  const anchorVertexIndexes = new Set<number>();
+  const traversedLineIndexes = new Set<number>();
+  let conflictVertexIndex: number | null = null;
+
+  const anchorToTopologyIndex: number[] = [];
+  MCV_DATA.structure.anchors.forEach((anchor, anchorIndex) => {
+    const topoIndex = findTopologyVertexIndexForAnchor(anchor, topologyVertices);
+    anchorToTopologyIndex[anchorIndex] = topoIndex;
+    if (topoIndex >= 0) {
+      anchorVertexIndexes.add(topoIndex);
+      generatedVertexIndexes.add(topoIndex);
+      const merge = mergeCoordIntoTarget(coords[topoIndex], getAnchorSeedCoord(anchor));
+      if (merge === "conflict" && conflictVertexIndex === null) {
+        conflictVertexIndex = topoIndex;
+      }
+      if (hasAnyCoord(coords[topoIndex]) && !inQueue.has(topoIndex)) {
+        queue.push(topoIndex);
+        inQueue.add(topoIndex);
+      }
+    }
+  });
+
+  while (queue.length > 0 && conflictVertexIndex === null) {
+    const currentVertex = queue.shift()!;
+    inQueue.delete(currentVertex);
+    const currentCoord = coords[currentVertex];
+    const edges = adjacency.get(currentVertex) || [];
+    for (const edge of edges) {
+      traversedLineIndexes.add(edge.lineIndex);
+      const forward = edge.fromVertex === currentVertex;
+      const nextVertex = forward ? edge.toVertex : edge.fromVertex;
+      const inferred = inferNeighborCoord(currentCoord, edge.axis, edge.length, forward);
+      generatedVertexIndexes.add(nextVertex);
+      const merge = mergeCoordIntoTarget(coords[nextVertex], inferred);
+      if (merge === "conflict") {
+        conflictVertexIndex = nextVertex;
+        break;
+      }
+      if (merge === "updated" && !inQueue.has(nextVertex)) {
+        queue.push(nextVertex);
+        inQueue.add(nextVertex);
+      }
+    }
+  }
+
+  const newVertices: StructureVertexData[] = [];
+  MCV_DATA.structure.anchors.forEach((anchor, anchorIndex) => {
+    const topoIndex = anchorToTopologyIndex[anchorIndex];
+    const topo = topoIndex >= 0 ? topologyVertices[topoIndex] : null;
+    const coord = topoIndex >= 0 ? coords[topoIndex] : {};
+    const nextVertex: StructureVertexData = {
+      from: normalizeLineRefs(topo ? topo.endpointIds.filter((id) => id % 2 === 0).map((id) => Math.floor(id / 2)) : anchor.from),
+      to: normalizeLineRefs(topo ? topo.endpointIds.filter((id) => id % 2 === 1).map((id) => Math.floor(id / 2)) : anchor.to),
+      anchor: anchorIndex,
+      ...(coord.x !== undefined ? { x: coord.x } : anchor.x !== undefined ? { x: anchor.x } : {}),
+      ...(coord.y !== undefined ? { y: coord.y } : anchor.y !== undefined ? { y: anchor.y } : {}),
+      ...(coord.z !== undefined ? { z: coord.z } : anchor.z !== undefined ? { z: anchor.z } : {}),
+    };
+    newVertices.push(nextVertex);
+    anchor.vertex = newVertices.length - 1;
+    if (nextVertex.x !== undefined) {
+      anchor.x = nextVertex.x;
+    } else {
+      delete anchor.x;
+    }
+    if (nextVertex.y !== undefined) {
+      anchor.y = nextVertex.y;
+    } else {
+      delete anchor.y;
+    }
+    if (nextVertex.z !== undefined) {
+      anchor.z = nextVertex.z;
+    } else {
+      delete anchor.z;
+    }
+  });
+
+  topologyVertices.forEach((topo, topoIndex) => {
+    if (!generatedVertexIndexes.has(topoIndex)) {
+      return;
+    }
+    if (anchorVertexIndexes.has(topoIndex)) {
+      return;
+    }
+    const coord = coords[topoIndex];
+    newVertices.push({
+      from: normalizeLineRefs(topo.endpointIds.filter((id) => id % 2 === 0).map((id) => Math.floor(id / 2))),
+      to: normalizeLineRefs(topo.endpointIds.filter((id) => id % 2 === 1).map((id) => Math.floor(id / 2))),
+      ...(coord.x !== undefined ? { x: coord.x } : {}),
+      ...(coord.y !== undefined ? { y: coord.y } : {}),
+      ...(coord.z !== undefined ? { z: coord.z } : {}),
+    });
+  });
+
+  MCV_DATA.structure.vertices = newVertices;
+  syncStructureEndpointRefs();
+
+  return {
+    traversedLineIndexes,
+    generatedVertexIndexes,
+    anchorVertexIndexes,
+    conflictVertexIndex,
+    topologyVertices,
+  };
+}
+
 function getCurrentLinesForDisplay(): Array<ManualAnnotation | StructureLine> {
   return renderAnnotationPreviewHeld ? MCV_DATA.annotations : MCV_DATA.structure.lines;
 }
@@ -2204,6 +2508,10 @@ function createManualModeCropResultSvg(
 
   const anchorMode = getManualInteractionMode() === "anchor";
   const editMode = getManualInteractionMode() === "edit";
+  const vertexSolveMode = getManualInteractionMode() === "vertexSolve";
+  const solveData = vertexSolveMode
+    ? (vertexSolveRenderData ?? (vertexSolveRenderData = runVertexSolveAndBuildData()))
+    : null;
   const potentialLinkIndexes = manualDraftLine ? getDraftPotentialLinkIndexes(manualDraftLine) : new Set<number>();
   const linesToRender: Array<ManualAnnotation | StructureLine> = getCurrentLinesForDisplay();
 
@@ -2228,7 +2536,11 @@ function createManualModeCropResultSvg(
     const editHighlighted =
       editMode && (manualEditHoveredLineIndex === index || manualEditSelectedLineIndex === index);
     const axisColor =
-      (anchorMode && anchorLightIndexes.has(index)) || editHighlighted
+      vertexSolveMode
+        ? solveData && solveData.traversedLineIndexes.has(index)
+          ? "#5dff74"
+          : "#ffffff"
+        : (anchorMode && anchorLightIndexes.has(index)) || editHighlighted
         ? getAxisLightColor(line.axis)
         : potentialLinkIndexes.has(index)
           ? getAxisLightColor(line.axis)
@@ -2240,13 +2552,13 @@ function createManualModeCropResultSvg(
       axisColor,
       2,
       1,
-      anchorMode ? undefined : getAxisMarkerId(line.axis)
+      anchorMode || vertexSolveMode ? undefined : getAxisMarkerId(line.axis)
     );
-    if (!anchorMode) {
+    if (!anchorMode && !vertexSolveMode) {
       appendSvgLineLabel(sceneGroup, segment, line.length, axisColor);
     }
   });
-  if (!anchorMode && manualDraftLine) {
+  if (!anchorMode && !vertexSolveMode && manualDraftLine) {
     const draftSegment = getLineSegmentForDraft(manualDraftLine);
     const axisColor = getAxisColor(manualDraftLine.axis);
     appendSvgLine(
@@ -2277,6 +2589,26 @@ function createManualModeCropResultSvg(
     });
     if (manualAnchorHoveredVertex) {
       appendSvgPointDot(sceneGroup, manualAnchorHoveredVertex.point, "#ffe46b", 2.8);
+    }
+  }
+  if (vertexSolveMode && solveData) {
+    MCV_DATA.structure.anchors.forEach((anchor) => {
+      const point = getAnchorPoint(anchor);
+      if (point) {
+        appendSvgPointDot(sceneGroup, point, "#5dff74", 2.6);
+      }
+    });
+    solveData.generatedVertexIndexes.forEach((vertexIndex) => {
+      const vertex = solveData.topologyVertices[vertexIndex];
+      if (vertex) {
+        appendSvgPointDot(sceneGroup, vertex.point, "#5dff74", 2.4);
+      }
+    });
+    if (solveData.conflictVertexIndex !== null) {
+      const conflict = solveData.topologyVertices[solveData.conflictVertexIndex];
+      if (conflict) {
+        appendSvgPointDot(sceneGroup, conflict.point, "#ff4d4d", 3.2);
+      }
     }
   }
 
@@ -2339,6 +2671,10 @@ function createManualModeCropResultSvg(
       renderCropResultFromCache();
       return;
     }
+    if (vertexSolveMode) {
+      event.preventDefault();
+      return;
+    }
     if (editMode) {
       const nearestLineIndex = findClosestDisplayedLineIndex(point);
       manualEditHoveredLineIndex = nearestLineIndex >= 0 ? nearestLineIndex : null;
@@ -2387,7 +2723,7 @@ function createManualModeCropResultSvg(
   });
 
   svg.addEventListener("contextmenu", (event) => {
-    if (!cropResultCache || event.ctrlKey || viewerCtrlHeld || anchorMode) {
+    if (!cropResultCache || event.ctrlKey || viewerCtrlHeld || anchorMode || vertexSolveMode) {
       return;
     }
     event.preventDefault();
@@ -2473,6 +2809,9 @@ function updateManualDraftFromPointer(pointer: PointerEvent): void {
   }
   if (getManualInteractionMode() === "edit") {
     updateEditHoverFromClient(pointer.clientX, pointer.clientY);
+    return;
+  }
+  if (getManualInteractionMode() === "vertexSolve") {
     return;
   }
 
@@ -3675,6 +4014,11 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       setManualInteractionMode("anchor");
       return;
     }
+    if (event.key === "s" || event.key === "S") {
+      event.preventDefault();
+      setManualInteractionMode("vertexSolve");
+      return;
+    }
     if (event.key === "4" || event.code === "Numpad4") {
       event.preventDefault();
       setManualInteractionMode("edit");
@@ -3687,6 +4031,8 @@ function handleViewerKeybind(event: KeyboardEvent): void {
         setManualAnchorSelection(null);
       } else if (getManualInteractionMode() === "edit") {
         manualEditSelectedLineIndex = null;
+      } else if (getManualInteractionMode() === "vertexSolve") {
+        // keep solve view active until explicit mode change
       } else if (manualDraftLine) {
         manualDraftLine = null;
         manualDragPointerId = null;
@@ -3716,7 +4062,11 @@ function handleViewerKeybind(event: KeyboardEvent): void {
     }
 
     if (event.ctrlKey && !event.shiftKey && (event.key === "z" || event.key === "Z")) {
-      if (getManualInteractionMode() === "anchor" || getManualInteractionMode() === "edit") {
+      if (
+        getManualInteractionMode() === "anchor" ||
+        getManualInteractionMode() === "edit" ||
+        getManualInteractionMode() === "vertexSolve"
+      ) {
         return;
       }
       event.preventDefault();
@@ -3733,7 +4083,11 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       return;
     }
     if (event.ctrlKey && !event.shiftKey && (event.key === "y" || event.key === "Y")) {
-      if (getManualInteractionMode() === "anchor" || getManualInteractionMode() === "edit") {
+      if (
+        getManualInteractionMode() === "anchor" ||
+        getManualInteractionMode() === "edit" ||
+        getManualInteractionMode() === "vertexSolve"
+      ) {
         return;
       }
       event.preventDefault();
@@ -3746,7 +4100,10 @@ function handleViewerKeybind(event: KeyboardEvent): void {
     }
 
     if (event.key === "ArrowUp" || event.key === "=" || event.key === "+") {
-      if (getManualInteractionMode() === "anchor") {
+      if (
+        getManualInteractionMode() === "anchor" ||
+        getManualInteractionMode() === "vertexSolve"
+      ) {
         return;
       }
       event.preventDefault();
@@ -3758,7 +4115,10 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       return;
     }
     if (event.key === "ArrowDown" || event.key === "-" || event.key === "_") {
-      if (getManualInteractionMode() === "anchor") {
+      if (
+        getManualInteractionMode() === "anchor" ||
+        getManualInteractionMode() === "vertexSolve"
+      ) {
         return;
       }
       event.preventDefault();
@@ -3779,6 +4139,12 @@ function handleViewerKeybind(event: KeyboardEvent): void {
           return;
         }
         updateSelectedLineAxis(axis, startsBackwards);
+        return;
+      }
+      if (getManualInteractionMode() === "vertexSolve") {
+        setManualInteractionMode("draw");
+        manualAxisSelection = axis;
+        manualAxisStartsBackwards = startsBackwards;
         return;
       }
       if (getManualInteractionMode() === "anchor") {
