@@ -56,8 +56,16 @@ type StructureLine = {
   axis: ManualAxis;
   length?: number;
 };
+type StructureAnchor = {
+  from: number[];
+  to: number[];
+  x?: number;
+  y?: number;
+  z?: number;
+};
 type StructureData = {
   lines: StructureLine[];
+  anchors: StructureAnchor[];
 };
 type DraftManualLine = {
   from: ManualPoint;
@@ -65,6 +73,12 @@ type DraftManualLine = {
   axis: ManualAxis;
   flipped: boolean;
   length?: number;
+};
+type ManualInteractionMode = "draw" | "anchor";
+type StructureVertex = {
+  endpointIds: number[];
+  point: ManualPoint;
+  lineIndexes: number[];
 };
 
 type McvImagePipelineResult = {
@@ -193,6 +207,7 @@ const MCV_DATA: { annotations: ManualAnnotation[]; structure: StructureData } = 
   annotations: [],
   structure: {
     lines: [],
+    anchors: [],
   },
 };
 let manualRedoLines: ManualAnnotation[] = [];
@@ -200,6 +215,10 @@ let manualDraftLine: DraftManualLine | null = null;
 let manualDragPointerId: number | null = null;
 let manualDragClientX = 0;
 let manualDragClientY = 0;
+let manualInteractionMode: ManualInteractionMode = "draw";
+let manualAnchorSelectedIndex: number | null = null;
+let manualAnchorSelectedInput = "";
+let manualAnchorHoveredVertex: StructureVertex | null = null;
 let viewerCtrlHeld = false;
 let renderAnnotationPreviewHeld = false;
 let viewerMotionRafId: number | null = null;
@@ -510,6 +529,25 @@ function popAnnotationWithStructureUnlink(): ManualAnnotation | undefined {
     line.to.from = line.to.from.filter((value) => value !== removedIndex);
     line.to.to = line.to.to.filter((value) => value !== removedIndex);
   });
+  MCV_DATA.structure.anchors = MCV_DATA.structure.anchors
+    .map((anchor) => {
+      const nextFrom = anchor.from
+        .filter((value) => value !== removedIndex)
+        .map((value) => (value > removedIndex ? value - 1 : value));
+      const nextTo = anchor.to
+        .filter((value) => value !== removedIndex)
+        .map((value) => (value > removedIndex ? value - 1 : value));
+      return {
+        ...anchor,
+        from: Array.from(new Set(nextFrom)).sort((a, b) => a - b),
+        to: Array.from(new Set(nextTo)).sort((a, b) => a - b),
+      };
+    })
+    .filter((anchor) => anchor.from.length > 0 || anchor.to.length > 0);
+  if (manualAnchorSelectedIndex !== null) {
+    manualAnchorSelectedIndex = null;
+    manualAnchorSelectedInput = "";
+  }
   recomputeStructureGeometryFromConnections();
   return removed;
 }
@@ -526,11 +564,16 @@ function rebuildStructureFromAnnotations(): void {
 function resetCropInteractionState(): void {
   MCV_DATA.annotations.length = 0;
   MCV_DATA.structure.lines.length = 0;
+  MCV_DATA.structure.anchors.length = 0;
   manualRedoLines.length = 0;
   manualDraftLine = null;
   manualDragPointerId = null;
   manualDragClientX = 0;
   manualDragClientY = 0;
+  manualInteractionMode = "draw";
+  manualAnchorSelectedIndex = null;
+  manualAnchorSelectedInput = "";
+  manualAnchorHoveredVertex = null;
   manualAxisStartsBackwards = false;
   renderAnnotationPreviewHeld = false;
 }
@@ -1161,6 +1204,46 @@ function appendSvgLineLabel(
   parent.appendChild(text);
 }
 
+function appendSvgPointDot(
+  parent: SVGElement,
+  point: ManualPoint,
+  color: string,
+  radius: number
+): void {
+  const svgNs = "http://www.w3.org/2000/svg";
+  const circle = document.createElementNS(svgNs, "circle");
+  circle.setAttribute("cx", String(point.x));
+  circle.setAttribute("cy", String(point.y));
+  circle.setAttribute("r", String(radius));
+  circle.setAttribute("fill", color);
+  circle.setAttribute("stroke", "#111821");
+  circle.setAttribute("stroke-width", "0.8");
+  circle.setAttribute("vector-effect", "non-scaling-stroke");
+  parent.appendChild(circle);
+}
+
+function appendSvgAnchorLabel(
+  parent: SVGElement,
+  point: ManualPoint,
+  label: string,
+  color: string
+): void {
+  const svgNs = "http://www.w3.org/2000/svg";
+  const text = document.createElementNS(svgNs, "text");
+  text.setAttribute("x", String(point.x + 6));
+  text.setAttribute("y", String(point.y - 6));
+  text.setAttribute("fill", color);
+  text.setAttribute("stroke", "#111821");
+  text.setAttribute("stroke-width", "0.9");
+  text.setAttribute("paint-order", "stroke fill");
+  text.setAttribute("font-size", "9");
+  text.setAttribute("font-weight", "700");
+  text.setAttribute("font-family", "Segoe UI, Tahoma, sans-serif");
+  text.setAttribute("vector-effect", "non-scaling-stroke");
+  text.textContent = label;
+  parent.appendChild(text);
+}
+
 function adjustDraftEdgeLength(delta: number): void {
   if (!manualDraftLine) {
     return;
@@ -1210,6 +1293,380 @@ function getAxisLightColor(axis: ManualAxis): string {
     return "#a6ffb3";
   }
   return "#9ec7ff";
+}
+
+function getManualInteractionMode(): ManualInteractionMode {
+  return manualInteractionMode;
+}
+
+function setManualInteractionMode(mode: ManualInteractionMode): void {
+  if (manualInteractionMode === mode) {
+    return;
+  }
+  manualInteractionMode = mode;
+  if (mode === "anchor") {
+    manualDraftLine = null;
+    manualDragPointerId = null;
+  } else {
+    manualAnchorHoveredVertex = null;
+    manualAnchorSelectedIndex = null;
+    manualAnchorSelectedInput = "";
+  }
+  renderCropResultFromCache();
+}
+
+function buildAnchorInputFromAnchor(anchor: StructureAnchor): string {
+  const values: number[] = [];
+  if (anchor.x !== undefined) {
+    values.push(anchor.x);
+  }
+  if (anchor.y !== undefined) {
+    values.push(anchor.y);
+  }
+  if (anchor.z !== undefined) {
+    values.push(anchor.z);
+  }
+  return values.map((value) => String(value)).join(", ");
+}
+
+function buildAnchorLabelFromInput(input: string): string {
+  return `(${input})`;
+}
+
+function getAnchorLabel(anchor: StructureAnchor, index: number): string {
+  if (manualAnchorSelectedIndex === index) {
+    return buildAnchorLabelFromInput(manualAnchorSelectedInput);
+  }
+  return buildAnchorLabelFromInput(buildAnchorInputFromAnchor(anchor));
+}
+
+function setManualAnchorSelection(index: number | null): void {
+  manualAnchorSelectedIndex = index;
+  if (index === null) {
+    manualAnchorSelectedInput = "";
+    return;
+  }
+  const anchor = MCV_DATA.structure.anchors[index];
+  manualAnchorSelectedInput = anchor ? buildAnchorInputFromAnchor(anchor) : "";
+}
+
+function updateSelectedAnchorCoordinatesFromInput(): void {
+  if (manualAnchorSelectedIndex === null) {
+    return;
+  }
+  const anchor = MCV_DATA.structure.anchors[manualAnchorSelectedIndex];
+  if (!anchor) {
+    setManualAnchorSelection(null);
+    return;
+  }
+  const tokens = manualAnchorSelectedInput.length > 0 ? manualAnchorSelectedInput.split(", ") : [];
+  const parsed: Array<number | undefined> = [undefined, undefined, undefined];
+  for (let i = 0; i < Math.min(3, tokens.length); i += 1) {
+    const token = tokens[i];
+    if (/^-?\d+$/.test(token)) {
+      parsed[i] = Number.parseInt(token, 10);
+    } else {
+      parsed[i] = undefined;
+    }
+  }
+  if (parsed[0] !== undefined) {
+    anchor.x = parsed[0];
+  } else {
+    delete anchor.x;
+  }
+  if (parsed[1] !== undefined) {
+    anchor.y = parsed[1];
+  } else {
+    delete anchor.y;
+  }
+  if (parsed[2] !== undefined) {
+    anchor.z = parsed[2];
+  } else {
+    delete anchor.z;
+  }
+}
+
+function tryHandleAnchorInputKey(event: KeyboardEvent): boolean {
+  if (manualAnchorSelectedIndex === null) {
+    return false;
+  }
+  if (event.key === " ") {
+    event.preventDefault();
+    return true;
+  }
+  if (event.key === "Backspace") {
+    event.preventDefault();
+    if (manualAnchorSelectedInput.endsWith(", ")) {
+      manualAnchorSelectedInput = manualAnchorSelectedInput.slice(0, -2);
+    } else {
+      manualAnchorSelectedInput = manualAnchorSelectedInput.slice(0, -1);
+    }
+    updateSelectedAnchorCoordinatesFromInput();
+    renderCropResultFromCache();
+    return true;
+  }
+  if (event.key === ",") {
+    event.preventDefault();
+    if (manualAnchorSelectedInput.length === 0) {
+      return true;
+    }
+    const tokens = manualAnchorSelectedInput.split(", ");
+    if (tokens.length >= 3) {
+      return true;
+    }
+    const lastToken = tokens[tokens.length - 1];
+    if (!/^-?\d+$/.test(lastToken)) {
+      return true;
+    }
+    manualAnchorSelectedInput += ", ";
+    updateSelectedAnchorCoordinatesFromInput();
+    renderCropResultFromCache();
+    return true;
+  }
+  if (event.key === "-") {
+    event.preventDefault();
+    const tokenStart = manualAnchorSelectedInput.lastIndexOf(", ") + 2;
+    const currentToken = manualAnchorSelectedInput.slice(tokenStart);
+    if (currentToken.length === 0) {
+      manualAnchorSelectedInput += "-";
+      updateSelectedAnchorCoordinatesFromInput();
+      renderCropResultFromCache();
+    }
+    return true;
+  }
+  if (/^[0-9]$/.test(event.key)) {
+    event.preventDefault();
+    const tokens = manualAnchorSelectedInput.length > 0 ? manualAnchorSelectedInput.split(", ") : [];
+    if (tokens.length <= 3) {
+      manualAnchorSelectedInput += event.key;
+      updateSelectedAnchorCoordinatesFromInput();
+      renderCropResultFromCache();
+    }
+    return true;
+  }
+  return false;
+}
+
+function getStructureEndpointById(endpointId: number): StructureEndpoint | null {
+  const lineIndex = Math.floor(endpointId / 2);
+  const endpointType = endpointId % 2 === 0 ? "from" : "to";
+  const line = MCV_DATA.structure.lines[lineIndex];
+  if (!line) {
+    return null;
+  }
+  return line[endpointType];
+}
+
+function collectStructureVertices(): StructureVertex[] {
+  const lines = MCV_DATA.structure.lines;
+  const endpointCount = lines.length * 2;
+  if (endpointCount === 0) {
+    return [];
+  }
+  const adjacency = Array.from({ length: endpointCount }, () => new Set<number>());
+  const connect = (a: number, b: number) => {
+    if (a === b || a < 0 || b < 0 || a >= endpointCount || b >= endpointCount) {
+      return;
+    }
+    adjacency[a].add(b);
+    adjacency[b].add(a);
+  };
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
+    const fromId = lineIndex * 2;
+    const toId = fromId + 1;
+    line.from.from.forEach((otherIndex) => connect(fromId, otherIndex * 2));
+    line.from.to.forEach((otherIndex) => connect(fromId, otherIndex * 2 + 1));
+    line.to.from.forEach((otherIndex) => connect(toId, otherIndex * 2));
+    line.to.to.forEach((otherIndex) => connect(toId, otherIndex * 2 + 1));
+  }
+
+  const visited = new Array<boolean>(endpointCount).fill(false);
+  const vertices: StructureVertex[] = [];
+  for (let start = 0; start < endpointCount; start += 1) {
+    if (visited[start]) {
+      continue;
+    }
+    const stack = [start];
+    const endpointIds: number[] = [];
+    visited[start] = true;
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      endpointIds.push(current);
+      adjacency[current].forEach((next) => {
+        if (!visited[next]) {
+          visited[next] = true;
+          stack.push(next);
+        }
+      });
+    }
+    let sumX = 0;
+    let sumY = 0;
+    let count = 0;
+    const lineIndexSet = new Set<number>();
+    endpointIds.forEach((endpointId) => {
+      const endpoint = getStructureEndpointById(endpointId);
+      if (!endpoint) {
+        return;
+      }
+      sumX += endpoint.x;
+      sumY += endpoint.y;
+      count += 1;
+      lineIndexSet.add(Math.floor(endpointId / 2));
+    });
+    if (count > 0) {
+      vertices.push({
+        endpointIds: endpointIds.slice().sort((a, b) => a - b),
+        point: { x: sumX / count, y: sumY / count },
+        lineIndexes: Array.from(lineIndexSet).sort((a, b) => a - b),
+      });
+    }
+  }
+  return vertices;
+}
+
+function getAnchorEndpointIds(anchor: StructureAnchor): number[] {
+  const ids = new Set<number>();
+  anchor.from.forEach((lineIndex) => ids.add(lineIndex * 2));
+  anchor.to.forEach((lineIndex) => ids.add(lineIndex * 2 + 1));
+  return Array.from(ids).sort((a, b) => a - b);
+}
+
+function getAnchorPoint(anchor: StructureAnchor): ManualPoint | null {
+  const endpointIds = getAnchorEndpointIds(anchor);
+  if (endpointIds.length === 0) {
+    return null;
+  }
+  let sumX = 0;
+  let sumY = 0;
+  let count = 0;
+  endpointIds.forEach((endpointId) => {
+    const endpoint = getStructureEndpointById(endpointId);
+    if (!endpoint) {
+      return;
+    }
+    sumX += endpoint.x;
+    sumY += endpoint.y;
+    count += 1;
+  });
+  if (count === 0) {
+    return null;
+  }
+  return { x: sumX / count, y: sumY / count };
+}
+
+function getAnchorLinkedLineIndexes(anchor: StructureAnchor): Set<number> {
+  const indexes = new Set<number>();
+  anchor.from.forEach((lineIndex) => indexes.add(lineIndex));
+  anchor.to.forEach((lineIndex) => indexes.add(lineIndex));
+  return indexes;
+}
+
+function areSortedArraysEqual(first: number[], second: number[]): boolean {
+  if (first.length !== second.length) {
+    return false;
+  }
+  for (let i = 0; i < first.length; i += 1) {
+    if (first[i] !== second[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function findAnchorByLinks(from: number[], to: number[]): number {
+  const sortedFrom = Array.from(new Set(from)).sort((a, b) => a - b);
+  const sortedTo = Array.from(new Set(to)).sort((a, b) => a - b);
+  for (let index = 0; index < MCV_DATA.structure.anchors.length; index += 1) {
+    const anchor = MCV_DATA.structure.anchors[index];
+    if (
+      areSortedArraysEqual(sortedFrom, anchor.from) &&
+      areSortedArraysEqual(sortedTo, anchor.to)
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function getAnchorPointerHitRadiusInImagePixels(): number {
+  if (!cropResultCache) {
+    return 4;
+  }
+  const svg = getViewerCropResultSvgNode();
+  const rect = svg?.getBoundingClientRect();
+  if (!rect || rect.width <= 0) {
+    return 4;
+  }
+  return Math.max(3, (8 * cropResultCache.width) / rect.width);
+}
+
+function findNearestAnchorIndex(point: ManualPoint): number {
+  const threshold = getAnchorPointerHitRadiusInImagePixels();
+  let bestIndex = -1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < MCV_DATA.structure.anchors.length; index += 1) {
+    const anchorPoint = getAnchorPoint(MCV_DATA.structure.anchors[index]);
+    if (!anchorPoint) {
+      continue;
+    }
+    const distance = Math.hypot(anchorPoint.x - point.x, anchorPoint.y - point.y);
+    if (distance <= threshold && distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function updateAnchorHoverFromClient(clientX: number, clientY: number): void {
+  if (!cropResultCache || getManualInteractionMode() !== "anchor") {
+    if (manualAnchorHoveredVertex !== null) {
+      manualAnchorHoveredVertex = null;
+      renderCropResultFromCache();
+    }
+    return;
+  }
+  const point = getCropPointFromClient(clientX, clientY, cropResultCache.width, cropResultCache.height);
+  if (!point) {
+    if (manualAnchorHoveredVertex !== null) {
+      manualAnchorHoveredVertex = null;
+      renderCropResultFromCache();
+    }
+    return;
+  }
+  const next = findNearestStructureVertex(point);
+  if (!next) {
+    if (manualAnchorHoveredVertex !== null) {
+      manualAnchorHoveredVertex = null;
+      renderCropResultFromCache();
+    }
+    return;
+  }
+  const changed =
+    !manualAnchorHoveredVertex ||
+    !areSortedArraysEqual(manualAnchorHoveredVertex.endpointIds, next.endpointIds);
+  if (changed) {
+    manualAnchorHoveredVertex = next;
+    renderCropResultFromCache();
+  }
+}
+
+function findNearestStructureVertex(point: ManualPoint): StructureVertex | null {
+  const vertices = collectStructureVertices();
+  if (vertices.length === 0) {
+    return null;
+  }
+  let best: StructureVertex | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  vertices.forEach((vertex) => {
+    const distance = Math.hypot(vertex.point.x - point.x, vertex.point.y - point.y);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = vertex;
+    }
+  });
+  return best;
 }
 
 function getAxisMarkerId(axis: ManualAxis): string {
@@ -1328,12 +1785,36 @@ function createManualModeCropResultSvg(
     return svg;
   }
 
+  const anchorMode = getManualInteractionMode() === "anchor";
   const potentialLinkIndexes = manualDraftLine ? getDraftPotentialLinkIndexes(manualDraftLine) : new Set<number>();
   const linesToRender: Array<ManualAnnotation | StructureLine> = renderAnnotationPreviewHeld
     ? MCV_DATA.annotations
     : MCV_DATA.structure.lines;
+
+  const anchorLightIndexes = new Set<number>();
+  if (anchorMode) {
+    if (manualAnchorHoveredVertex) {
+      manualAnchorHoveredVertex.lineIndexes.forEach((lineIndex) => {
+        anchorLightIndexes.add(lineIndex);
+      });
+    }
+    if (manualAnchorSelectedIndex !== null) {
+      const selectedAnchor = MCV_DATA.structure.anchors[manualAnchorSelectedIndex];
+      if (selectedAnchor) {
+        getAnchorLinkedLineIndexes(selectedAnchor).forEach((lineIndex) => {
+          anchorLightIndexes.add(lineIndex);
+        });
+      }
+    }
+  }
+
   linesToRender.forEach((line, index) => {
-    const axisColor = potentialLinkIndexes.has(index) ? getAxisLightColor(line.axis) : getAxisColor(line.axis);
+    const axisColor =
+      anchorMode && anchorLightIndexes.has(index)
+        ? getAxisLightColor(line.axis)
+        : potentialLinkIndexes.has(index)
+          ? getAxisLightColor(line.axis)
+          : getAxisColor(line.axis);
     const segment = getLineSegmentForLine(line);
     appendSvgLine(
       sceneGroup,
@@ -1341,11 +1822,13 @@ function createManualModeCropResultSvg(
       axisColor,
       2,
       1,
-      getAxisMarkerId(line.axis)
+      anchorMode ? undefined : getAxisMarkerId(line.axis)
     );
-    appendSvgLineLabel(sceneGroup, segment, line.length, axisColor);
+    if (!anchorMode) {
+      appendSvgLineLabel(sceneGroup, segment, line.length, axisColor);
+    }
   });
-  if (manualDraftLine) {
+  if (!anchorMode && manualDraftLine) {
     const draftSegment = getLineSegmentForDraft(manualDraftLine);
     const axisColor = getAxisColor(manualDraftLine.axis);
     appendSvgLine(
@@ -1357,6 +1840,26 @@ function createManualModeCropResultSvg(
       getAxisMarkerId(manualDraftLine.axis)
     );
     appendSvgLineLabel(sceneGroup, draftSegment, manualDraftLine.length, axisColor);
+  }
+
+  if (anchorMode) {
+    MCV_DATA.structure.anchors.forEach((anchor, index) => {
+      const point = getAnchorPoint(anchor);
+      if (!point) {
+        return;
+      }
+      const selected = manualAnchorSelectedIndex === index;
+      appendSvgPointDot(sceneGroup, point, selected ? "#5ca8ff" : "#ffffff", 2.2);
+      appendSvgAnchorLabel(
+        sceneGroup,
+        point,
+        getAnchorLabel(anchor, index),
+        selected ? "#5ca8ff" : "#ffffff"
+      );
+    });
+    if (manualAnchorHoveredVertex) {
+      appendSvgPointDot(sceneGroup, manualAnchorHoveredVertex.point, "#ffe46b", 2.8);
+    }
   }
 
   svg.addEventListener("pointerdown", (event) => {
@@ -1375,6 +1878,49 @@ function createManualModeCropResultSvg(
     if (!point) {
       return;
     }
+
+    if (anchorMode) {
+      const nearestVertex = findNearestStructureVertex(point);
+      manualAnchorHoveredVertex = nearestVertex;
+      const existingAnchorIndex = findNearestAnchorIndex(point);
+      if (existingAnchorIndex >= 0) {
+        setManualAnchorSelection(existingAnchorIndex);
+        event.preventDefault();
+        renderCropResultFromCache();
+        return;
+      }
+      if (!manualAnchorHoveredVertex) {
+        setManualAnchorSelection(null);
+        event.preventDefault();
+        renderCropResultFromCache();
+        return;
+      }
+      const from = Array.from(
+        new Set(
+          manualAnchorHoveredVertex.endpointIds
+            .filter((endpointId) => endpointId % 2 === 0)
+            .map((endpointId) => Math.floor(endpointId / 2))
+        )
+      ).sort((a, b) => a - b);
+      const to = Array.from(
+        new Set(
+          manualAnchorHoveredVertex.endpointIds
+            .filter((endpointId) => endpointId % 2 === 1)
+            .map((endpointId) => Math.floor(endpointId / 2))
+        )
+      ).sort((a, b) => a - b);
+      const existingIndex = findAnchorByLinks(from, to);
+      if (existingIndex >= 0) {
+        setManualAnchorSelection(existingIndex);
+      } else {
+        MCV_DATA.structure.anchors.push({ from, to });
+        setManualAnchorSelection(MCV_DATA.structure.anchors.length - 1);
+      }
+      event.preventDefault();
+      renderCropResultFromCache();
+      return;
+    }
+
     manualDraftLine = {
       from: { x: point.x, y: point.y },
       to: { x: point.x, y: point.y },
@@ -1414,7 +1960,7 @@ function createManualModeCropResultSvg(
   });
 
   svg.addEventListener("contextmenu", (event) => {
-    if (!cropResultCache || event.ctrlKey || viewerCtrlHeld) {
+    if (!cropResultCache || event.ctrlKey || viewerCtrlHeld || anchorMode) {
       return;
     }
     event.preventDefault();
@@ -1487,6 +2033,11 @@ function updateManualDraftFromPointer(pointer: PointerEvent): void {
         applyViewerTransformToSvg();
       }
     }
+    return;
+  }
+
+  if (getManualInteractionMode() === "anchor") {
+    updateAnchorHoverFromClient(pointer.clientX, pointer.clientY);
     return;
   }
 
@@ -2676,16 +3227,6 @@ function restoreFullUncroppedImageView(): void {
 }
 
 function handleViewerKeybind(event: KeyboardEvent): void {
-  if (event.key === "Escape") {
-    if (cropResultCache && viewerMedia?.kind === "image" && manualDraftLine) {
-      event.preventDefault();
-      manualDraftLine = null;
-      manualDragPointerId = null;
-      renderCropResultFromCache();
-    }
-    return;
-  }
-
   const target = event.target as HTMLElement | null;
   const targetIsEditable =
     !!target &&
@@ -2694,7 +3235,32 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       target.isContentEditable);
 
   if (cropResultCache && viewerMedia?.kind === "image" && !targetIsEditable) {
+    if (event.key === "a" || event.key === "A") {
+      event.preventDefault();
+      setManualInteractionMode("anchor");
+      return;
+    }
+
+    if (event.key === "Escape" || event.key === "Enter") {
+      event.preventDefault();
+      if (getManualInteractionMode() === "anchor") {
+        setManualAnchorSelection(null);
+      } else if (manualDraftLine) {
+        manualDraftLine = null;
+        manualDragPointerId = null;
+      }
+      renderCropResultFromCache();
+      return;
+    }
+
+    if (getManualInteractionMode() === "anchor" && tryHandleAnchorInputKey(event)) {
+      return;
+    }
+
     if (event.ctrlKey && !event.shiftKey && (event.key === "z" || event.key === "Z")) {
+      if (getManualInteractionMode() === "anchor") {
+        return;
+      }
       event.preventDefault();
       if (manualDraftLine) {
         manualDraftLine = null;
@@ -2709,6 +3275,9 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       return;
     }
     if (event.ctrlKey && !event.shiftKey && (event.key === "y" || event.key === "Y")) {
+      if (getManualInteractionMode() === "anchor") {
+        return;
+      }
       event.preventDefault();
       const restored = manualRedoLines.pop();
       if (restored) {
@@ -2719,17 +3288,26 @@ function handleViewerKeybind(event: KeyboardEvent): void {
     }
 
     if (event.key === "ArrowUp" || event.key === "=" || event.key === "+") {
+      if (getManualInteractionMode() === "anchor") {
+        return;
+      }
       event.preventDefault();
       adjustDraftEdgeLength(1);
       return;
     }
     if (event.key === "ArrowDown" || event.key === "-" || event.key === "_") {
+      if (getManualInteractionMode() === "anchor") {
+        return;
+      }
       event.preventDefault();
       adjustDraftEdgeLength(-1);
       return;
     }
 
     const applyAxisSelection = (axis: ManualAxis, startsBackwards: boolean) => {
+      if (getManualInteractionMode() === "anchor") {
+        setManualInteractionMode("draw");
+      }
       manualAxisSelection = axis;
       manualAxisStartsBackwards = startsBackwards;
       if (manualDraftLine) {
@@ -2772,6 +3350,9 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       return;
     }
     if (event.key === "Tab" && manualDraftLine) {
+      if (getManualInteractionMode() === "anchor") {
+        return;
+      }
       event.preventDefault();
       manualDraftLine = {
         ...manualDraftLine,
