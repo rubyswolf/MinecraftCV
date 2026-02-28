@@ -49,6 +49,8 @@ type ManualAnnotation = {
 type StructureEndpoint = ManualPoint & {
   from: number[];
   to: number[];
+  anchor?: number;
+  vertex?: number;
 };
 type StructureLine = {
   from: StructureEndpoint;
@@ -59,6 +61,15 @@ type StructureLine = {
 type StructureAnchor = {
   from: number[];
   to: number[];
+  vertex: number;
+  x?: number;
+  y?: number;
+  z?: number;
+};
+type StructureVertexData = {
+  from: number[];
+  to: number[];
+  anchor?: number;
   x?: number;
   y?: number;
   z?: number;
@@ -66,6 +77,7 @@ type StructureAnchor = {
 type StructureData = {
   lines: StructureLine[];
   anchors: StructureAnchor[];
+  vertices: StructureVertexData[];
 };
 type DraftManualLine = {
   from: ManualPoint;
@@ -208,6 +220,7 @@ const MCV_DATA: { annotations: ManualAnnotation[]; structure: StructureData } = 
   structure: {
     lines: [],
     anchors: [],
+    vertices: [],
   },
 };
 let manualRedoLines: ManualAnnotation[] = [];
@@ -313,6 +326,149 @@ function createStructureLineFromAnnotation(annotation: ManualAnnotation): Struct
     axis: annotation.axis,
     ...(annotation.length !== undefined && annotation.length > 0 ? { length: annotation.length } : {}),
   };
+}
+
+function normalizeLineRefs(values: number[]): number[] {
+  return Array.from(new Set(values)).sort((a, b) => a - b);
+}
+
+function remapLineRefsAfterLineRemoval(values: number[], removedLineIndex: number): number[] {
+  return normalizeLineRefs(
+    values
+      .filter((value) => value !== removedLineIndex)
+      .map((value) => (value > removedLineIndex ? value - 1 : value))
+  );
+}
+
+function syncStructureEndpointRefs(): void {
+  MCV_DATA.structure.lines.forEach((line) => {
+    delete line.from.anchor;
+    delete line.to.anchor;
+    delete line.from.vertex;
+    delete line.to.vertex;
+  });
+  MCV_DATA.structure.anchors.forEach((anchor, anchorIndex) => {
+    anchor.from.forEach((lineIndex) => {
+      const line = MCV_DATA.structure.lines[lineIndex];
+      if (line) {
+        line.from.anchor = anchorIndex;
+      }
+    });
+    anchor.to.forEach((lineIndex) => {
+      const line = MCV_DATA.structure.lines[lineIndex];
+      if (line) {
+        line.to.anchor = anchorIndex;
+      }
+    });
+  });
+  MCV_DATA.structure.vertices.forEach((vertex, vertexIndex) => {
+    vertex.from.forEach((lineIndex) => {
+      const line = MCV_DATA.structure.lines[lineIndex];
+      if (line) {
+        line.from.vertex = vertexIndex;
+      }
+    });
+    vertex.to.forEach((lineIndex) => {
+      const line = MCV_DATA.structure.lines[lineIndex];
+      if (line) {
+        line.to.vertex = vertexIndex;
+      }
+    });
+  });
+}
+
+function rebuildAnchorsAndVerticesAfterLineRemoval(removedLineIndex: number): void {
+  const oldAnchors = MCV_DATA.structure.anchors;
+  const oldVertices = MCV_DATA.structure.vertices;
+
+  const keptAnchors = oldAnchors
+    .map((anchor, oldAnchorIndex) => {
+      const from = remapLineRefsAfterLineRemoval(anchor.from, removedLineIndex);
+      const to = remapLineRefsAfterLineRemoval(anchor.to, removedLineIndex);
+      if (from.length === 0 && to.length === 0) {
+        return null;
+      }
+      return {
+        oldAnchorIndex,
+        anchor: {
+          ...anchor,
+          from,
+          to,
+        },
+      };
+    })
+    .filter((value): value is { oldAnchorIndex: number; anchor: StructureAnchor } => !!value);
+
+  const remappedVertices = oldVertices.map((vertex) => ({
+    ...vertex,
+    from: remapLineRefsAfterLineRemoval(vertex.from, removedLineIndex),
+    to: remapLineRefsAfterLineRemoval(vertex.to, removedLineIndex),
+  }));
+
+  const newVertices: StructureVertexData[] = [];
+  const usedOldVertexIndexes = new Set<number>();
+
+  keptAnchors.forEach((entry, newAnchorIndex) => {
+    const oldVertexIndex = entry.anchor.vertex;
+    const oldVertex =
+      oldVertexIndex >= 0 && oldVertexIndex < remappedVertices.length
+        ? remappedVertices[oldVertexIndex]
+        : undefined;
+    if (oldVertex !== undefined) {
+      usedOldVertexIndexes.add(oldVertexIndex);
+    }
+    const vertexFrom = oldVertex ? oldVertex.from : entry.anchor.from;
+    const vertexTo = oldVertex ? oldVertex.to : entry.anchor.to;
+    const nextVertex: StructureVertexData = {
+      from: normalizeLineRefs(vertexFrom.length > 0 ? vertexFrom : entry.anchor.from),
+      to: normalizeLineRefs(vertexTo.length > 0 ? vertexTo : entry.anchor.to),
+      ...(oldVertex?.x !== undefined ? { x: oldVertex.x } : {}),
+      ...(oldVertex?.y !== undefined ? { y: oldVertex.y } : {}),
+      ...(oldVertex?.z !== undefined ? { z: oldVertex.z } : {}),
+      anchor: newAnchorIndex,
+    };
+    newVertices.push(nextVertex);
+    entry.anchor.vertex = newVertices.length - 1;
+  });
+
+  remappedVertices.forEach((vertex, oldVertexIndex) => {
+    if (usedOldVertexIndexes.has(oldVertexIndex)) {
+      return;
+    }
+    if (vertex.anchor !== undefined) {
+      return;
+    }
+    newVertices.push({
+      ...vertex,
+      from: normalizeLineRefs(vertex.from),
+      to: normalizeLineRefs(vertex.to),
+    });
+  });
+
+  MCV_DATA.structure.anchors = keptAnchors.map((entry) => ({
+    ...entry.anchor,
+    from: normalizeLineRefs(entry.anchor.from),
+    to: normalizeLineRefs(entry.anchor.to),
+  }));
+  MCV_DATA.structure.vertices = newVertices;
+}
+
+function createAnchorWithVertex(from: number[], to: number[]): number {
+  const normalizedFrom = normalizeLineRefs(from);
+  const normalizedTo = normalizeLineRefs(to);
+  const vertexIndex = MCV_DATA.structure.vertices.length;
+  const anchorIndex = MCV_DATA.structure.anchors.length;
+  MCV_DATA.structure.vertices.push({
+    from: normalizedFrom,
+    to: normalizedTo,
+    anchor: anchorIndex,
+  });
+  MCV_DATA.structure.anchors.push({
+    from: normalizedFrom,
+    to: normalizedTo,
+    vertex: vertexIndex,
+  });
+  return anchorIndex;
 }
 
 function getInfiniteLineIntersection(
@@ -516,6 +672,7 @@ function pushAnnotationWithStructureLink(annotation: ManualAnnotation): void {
   MCV_DATA.structure.lines.push(createStructureLineFromAnnotation(annotation));
   linkLineIndexAgainstOthers(MCV_DATA.structure.lines.length - 1);
   recomputeStructureGeometryFromConnections();
+  syncStructureEndpointRefs();
 }
 
 function popAnnotationWithStructureUnlink(): ManualAnnotation | undefined {
@@ -531,21 +688,7 @@ function popAnnotationWithStructureUnlink(): ManualAnnotation | undefined {
     line.to.from = line.to.from.filter((value) => value !== removedIndex);
     line.to.to = line.to.to.filter((value) => value !== removedIndex);
   });
-  MCV_DATA.structure.anchors = MCV_DATA.structure.anchors
-    .map((anchor) => {
-      const nextFrom = anchor.from
-        .filter((value) => value !== removedIndex)
-        .map((value) => (value > removedIndex ? value - 1 : value));
-      const nextTo = anchor.to
-        .filter((value) => value !== removedIndex)
-        .map((value) => (value > removedIndex ? value - 1 : value));
-      return {
-        ...anchor,
-        from: Array.from(new Set(nextFrom)).sort((a, b) => a - b),
-        to: Array.from(new Set(nextTo)).sort((a, b) => a - b),
-      };
-    })
-    .filter((anchor) => anchor.from.length > 0 || anchor.to.length > 0);
+  rebuildAnchorsAndVerticesAfterLineRemoval(removedIndex);
   if (manualAnchorSelectedIndex !== null) {
     manualAnchorSelectedIndex = null;
     manualAnchorSelectedInput = "";
@@ -565,6 +708,7 @@ function popAnnotationWithStructureUnlink(): ManualAnnotation | undefined {
     }
   }
   recomputeStructureGeometryFromConnections();
+  syncStructureEndpointRefs();
   return removed;
 }
 
@@ -575,12 +719,14 @@ function rebuildStructureFromAnnotations(): void {
     linkLineIndexAgainstOthers(i);
   }
   recomputeStructureGeometryFromConnections();
+  syncStructureEndpointRefs();
 }
 
 function resetCropInteractionState(): void {
   MCV_DATA.annotations.length = 0;
   MCV_DATA.structure.lines.length = 0;
   MCV_DATA.structure.anchors.length = 0;
+  MCV_DATA.structure.vertices.length = 0;
   manualRedoLines.length = 0;
   manualDraftLine = null;
   manualDragPointerId = null;
@@ -1412,6 +1558,24 @@ function updateSelectedAnchorCoordinatesFromInput(): void {
   } else {
     delete anchor.z;
   }
+  const vertex = MCV_DATA.structure.vertices[anchor.vertex];
+  if (vertex) {
+    if (anchor.x !== undefined) {
+      vertex.x = anchor.x;
+    } else {
+      delete vertex.x;
+    }
+    if (anchor.y !== undefined) {
+      vertex.y = anchor.y;
+    } else {
+      delete vertex.y;
+    }
+    if (anchor.z !== undefined) {
+      vertex.z = anchor.z;
+    } else {
+      delete vertex.z;
+    }
+  }
 }
 
 function tryHandleAnchorInputKey(event: KeyboardEvent): boolean {
@@ -1771,6 +1935,24 @@ function swapAnchorEndpointForLine(lineIndex: number): void {
     anchor.from = Array.from(new Set(anchor.from)).sort((a, b) => a - b);
     anchor.to = Array.from(new Set(anchor.to)).sort((a, b) => a - b);
   });
+  MCV_DATA.structure.vertices.forEach((vertex) => {
+    const hasFrom = vertex.from.includes(lineIndex);
+    const hasTo = vertex.to.includes(lineIndex);
+    if (hasFrom) {
+      vertex.from = vertex.from.filter((value) => value !== lineIndex);
+    }
+    if (hasTo) {
+      vertex.to = vertex.to.filter((value) => value !== lineIndex);
+    }
+    if (hasFrom) {
+      vertex.to.push(lineIndex);
+    }
+    if (hasTo) {
+      vertex.from.push(lineIndex);
+    }
+    vertex.from = normalizeLineRefs(vertex.from);
+    vertex.to = normalizeLineRefs(vertex.to);
+  });
 }
 
 function adjustSelectedLineLength(delta: number): void {
@@ -1843,7 +2025,30 @@ function removeAnchorAtIndex(anchorIndex: number): void {
   if (anchorIndex < 0 || anchorIndex >= MCV_DATA.structure.anchors.length) {
     return;
   }
+  const removedAnchor = MCV_DATA.structure.anchors[anchorIndex];
+  const removedVertexIndex = removedAnchor.vertex;
   MCV_DATA.structure.anchors.splice(anchorIndex, 1);
+  if (removedVertexIndex >= 0 && removedVertexIndex < MCV_DATA.structure.vertices.length) {
+    MCV_DATA.structure.vertices.splice(removedVertexIndex, 1);
+  }
+  MCV_DATA.structure.anchors.forEach((anchor, index) => {
+    if (anchor.vertex > removedVertexIndex) {
+      anchor.vertex -= 1;
+    }
+    const vertex = MCV_DATA.structure.vertices[anchor.vertex];
+    if (vertex) {
+      vertex.anchor = index;
+    }
+  });
+  MCV_DATA.structure.vertices.forEach((vertex) => {
+    if (vertex.anchor !== undefined) {
+      if (vertex.anchor === anchorIndex) {
+        delete vertex.anchor;
+      } else if (vertex.anchor > anchorIndex) {
+        vertex.anchor -= 1;
+      }
+    }
+  });
   if (manualAnchorSelectedIndex !== null) {
     if (manualAnchorSelectedIndex === anchorIndex) {
       manualAnchorSelectedIndex = null;
@@ -1852,6 +2057,7 @@ function removeAnchorAtIndex(anchorIndex: number): void {
       manualAnchorSelectedIndex -= 1;
     }
   }
+  syncStructureEndpointRefs();
   renderCropResultFromCache();
 }
 
@@ -1860,21 +2066,7 @@ function removeLineAtIndex(lineIndex: number): void {
     return;
   }
   MCV_DATA.annotations.splice(lineIndex, 1);
-  MCV_DATA.structure.anchors = MCV_DATA.structure.anchors
-    .map((anchor) => {
-      const nextFrom = anchor.from
-        .filter((value) => value !== lineIndex)
-        .map((value) => (value > lineIndex ? value - 1 : value));
-      const nextTo = anchor.to
-        .filter((value) => value !== lineIndex)
-        .map((value) => (value > lineIndex ? value - 1 : value));
-      return {
-        ...anchor,
-        from: Array.from(new Set(nextFrom)).sort((a, b) => a - b),
-        to: Array.from(new Set(nextTo)).sort((a, b) => a - b),
-      };
-    })
-    .filter((anchor) => anchor.from.length > 0 || anchor.to.length > 0);
+  rebuildAnchorsAndVerticesAfterLineRemoval(lineIndex);
   if (manualEditSelectedLineIndex !== null) {
     if (manualEditSelectedLineIndex === lineIndex) {
       manualEditSelectedLineIndex = null;
@@ -2139,8 +2331,9 @@ function createManualModeCropResultSvg(
       if (existingIndex >= 0) {
         setManualAnchorSelection(existingIndex);
       } else {
-        MCV_DATA.structure.anchors.push({ from, to });
-        setManualAnchorSelection(MCV_DATA.structure.anchors.length - 1);
+        const createdIndex = createAnchorWithVertex(from, to);
+        syncStructureEndpointRefs();
+        setManualAnchorSelection(createdIndex);
       }
       event.preventDefault();
       renderCropResultFromCache();
