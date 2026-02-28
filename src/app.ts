@@ -217,6 +217,13 @@ let currentAnalyzedImageObjectUrl: string | null = null;
 let viewerVideoNode: HTMLVideoElement | null = null;
 let viewerHmsInput: HTMLInputElement | null = null;
 let viewerEditingField: "hms" | null = null;
+let pendingImportedMcvState:
+  | {
+      annotations: ManualAnnotation[];
+      anchors: StructureAnchor[];
+      vertices: StructureVertexData[];
+    }
+  | null = null;
 let launchSelectionIntent: LaunchSelectionIntent | null = null;
 let cropResultCache:
   | {
@@ -1296,6 +1303,11 @@ function showViewerFullImage(src: string, alt: string): void {
         height,
       };
       renderCropResultFromCache();
+      if (pendingImportedMcvState) {
+        applyImportedMcvState(pendingImportedMcvState);
+        pendingImportedMcvState = null;
+        renderCropResultFromCache();
+      }
       image.classList.add("hidden");
       startViewerMotionLoop();
       updateViewerCursor();
@@ -3425,6 +3437,466 @@ function inferMediaKindFromFile(file: File): MediaKind {
   return fakeUrl ? inferMediaKindFromUrl(fakeUrl) : "video";
 }
 
+function isSvgFile(file: File): boolean {
+  const name = file.name.toLowerCase();
+  return file.type === "image/svg+xml" || name.endsWith(".svg");
+}
+
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Failed to read file text"));
+    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+    reader.readAsText(file);
+  });
+}
+
+function readBlobAsDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Failed to read blob"));
+    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function ensureEmbeddedImageDataUrl(source: string): Promise<string> {
+  if (source.startsWith("data:")) {
+    return source;
+  }
+  if (source.startsWith("blob:")) {
+    const response = await fetch(source);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image blob: ${response.status}`);
+    }
+    const blob = await response.blob();
+    return await readBlobAsDataUrl(blob);
+  }
+  const response = await fetch(source, { mode: "cors" });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch image source: ${response.status}`);
+  }
+  return await readBlobAsDataUrl(await response.blob());
+}
+
+function createSvgLayer(
+  svg: SVGSVGElement,
+  label: string,
+  visible: boolean
+): SVGGElement {
+  const svgNs = "http://www.w3.org/2000/svg";
+  const g = document.createElementNS(svgNs, "g");
+  g.setAttribute("inkscape:groupmode", "layer");
+  g.setAttribute("inkscape:label", label);
+  if (!visible) {
+    g.setAttribute("style", "display:none");
+  }
+  svg.appendChild(g);
+  return g;
+}
+
+function renderLinesToLayer(
+  layer: SVGGElement,
+  lines: Array<ManualAnnotation | StructureLine>,
+  includeArrows: boolean,
+  includeLengths: boolean
+): void {
+  lines.forEach((line) => {
+    const color = getAxisColor(line.axis);
+    const segment = getLineSegmentForLine(line);
+    appendSvgLine(layer, segment, color, 2, 1, includeArrows ? getAxisMarkerId(line.axis) : undefined);
+    if (includeLengths) {
+      appendSvgLineLabel(layer, segment, line.length, color);
+    }
+  });
+}
+
+function getVertexDotPoint(vertex: StructureVertexData): ManualPoint | null {
+  const endpointIds = [
+    ...vertex.from.map((lineIndex) => lineIndex * 2),
+    ...vertex.to.map((lineIndex) => lineIndex * 2 + 1),
+  ];
+  if (endpointIds.length === 0) {
+    return null;
+  }
+  let sumX = 0;
+  let sumY = 0;
+  let count = 0;
+  endpointIds.forEach((endpointId) => {
+    const endpoint = getStructureEndpointById(endpointId);
+    if (!endpoint) {
+      return;
+    }
+    sumX += endpoint.x;
+    sumY += endpoint.y;
+    count += 1;
+  });
+  if (count === 0) {
+    return null;
+  }
+  return { x: sumX / count, y: sumY / count };
+}
+
+function normalizeImportedAxis(value: unknown): ManualAxis | null {
+  return value === "x" || value === "y" || value === "z" ? value : null;
+}
+
+function normalizeImportedLineRefs(value: unknown, maxLines: number): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return normalizeLineRefs(
+    value
+      .map((item) => (typeof item === "number" && Number.isInteger(item) ? item : -1))
+      .filter((index) => index >= 0 && index < maxLines)
+  );
+}
+
+function normalizeImportedMcvData(value: unknown): {
+  annotations: ManualAnnotation[];
+  anchors: StructureAnchor[];
+  vertices: StructureVertexData[];
+} | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const data = value as Record<string, unknown>;
+  if (!Array.isArray(data.annotations)) {
+    return null;
+  }
+
+  const annotations: ManualAnnotation[] = [];
+  for (const entry of data.annotations) {
+    if (typeof entry !== "object" || entry === null) {
+      continue;
+    }
+    const item = entry as Record<string, unknown>;
+    const axis = normalizeImportedAxis(item.axis);
+    const fromObj = item.from as Record<string, unknown> | undefined;
+    const toObj = item.to as Record<string, unknown> | undefined;
+    const fx = typeof fromObj?.x === "number" ? fromObj.x : null;
+    const fy = typeof fromObj?.y === "number" ? fromObj.y : null;
+    const tx = typeof toObj?.x === "number" ? toObj.x : null;
+    const ty = typeof toObj?.y === "number" ? toObj.y : null;
+    if (axis === null || fx === null || fy === null || tx === null || ty === null) {
+      continue;
+    }
+    const line: ManualAnnotation = {
+      from: { x: fx, y: fy },
+      to: { x: tx, y: ty },
+      axis,
+    };
+    if (typeof item.length === "number" && Number.isFinite(item.length) && item.length > 0) {
+      line.length = item.length;
+    }
+    annotations.push(line);
+  }
+
+  const structure = data.structure as Record<string, unknown> | undefined;
+  const maxLines = annotations.length;
+  const parsedVertices: StructureVertexData[] = [];
+  if (Array.isArray(structure?.vertices)) {
+    for (const raw of structure!.vertices as unknown[]) {
+      if (typeof raw !== "object" || raw === null) {
+        continue;
+      }
+      const item = raw as Record<string, unknown>;
+      const vertex: StructureVertexData = {
+        from: normalizeImportedLineRefs(item.from, maxLines),
+        to: normalizeImportedLineRefs(item.to, maxLines),
+      };
+      if (typeof item.anchor === "number" && Number.isInteger(item.anchor) && item.anchor >= 0) {
+        vertex.anchor = item.anchor;
+      }
+      if (typeof item.x === "number" && Number.isFinite(item.x)) {
+        vertex.x = item.x;
+      }
+      if (typeof item.y === "number" && Number.isFinite(item.y)) {
+        vertex.y = item.y;
+      }
+      if (typeof item.z === "number" && Number.isFinite(item.z)) {
+        vertex.z = item.z;
+      }
+      parsedVertices.push(vertex);
+    }
+  }
+
+  const parsedAnchors: StructureAnchor[] = [];
+  if (Array.isArray(structure?.anchors)) {
+    for (const raw of structure!.anchors as unknown[]) {
+      if (typeof raw !== "object" || raw === null) {
+        continue;
+      }
+      const item = raw as Record<string, unknown>;
+      const anchor: StructureAnchor = {
+        from: normalizeImportedLineRefs(item.from, maxLines),
+        to: normalizeImportedLineRefs(item.to, maxLines),
+        vertex: typeof item.vertex === "number" && Number.isInteger(item.vertex) && item.vertex >= 0 ? item.vertex : -1,
+      };
+      if (typeof item.x === "number" && Number.isFinite(item.x)) {
+        anchor.x = item.x;
+      }
+      if (typeof item.y === "number" && Number.isFinite(item.y)) {
+        anchor.y = item.y;
+      }
+      if (typeof item.z === "number" && Number.isFinite(item.z)) {
+        anchor.z = item.z;
+      }
+      parsedAnchors.push(anchor);
+    }
+  }
+
+  const vertices: StructureVertexData[] = parsedVertices.map((vertex) => ({
+    ...vertex,
+    from: normalizeLineRefs(vertex.from),
+    to: normalizeLineRefs(vertex.to),
+  }));
+
+  parsedAnchors.forEach((anchor, anchorIndex) => {
+    let vertexIndex = anchor.vertex;
+    if (vertexIndex < 0 || vertexIndex >= vertices.length) {
+      vertexIndex = vertices.length;
+      vertices.push({
+        from: normalizeLineRefs(anchor.from),
+        to: normalizeLineRefs(anchor.to),
+        ...(anchor.x !== undefined ? { x: anchor.x } : {}),
+        ...(anchor.y !== undefined ? { y: anchor.y } : {}),
+        ...(anchor.z !== undefined ? { z: anchor.z } : {}),
+        anchor: anchorIndex,
+      });
+      anchor.vertex = vertexIndex;
+    } else {
+      const vertex = vertices[vertexIndex];
+      vertex.anchor = anchorIndex;
+      if (anchor.x !== undefined) {
+        vertex.x = anchor.x;
+      }
+      if (anchor.y !== undefined) {
+        vertex.y = anchor.y;
+      }
+      if (anchor.z !== undefined) {
+        vertex.z = anchor.z;
+      }
+      anchor.vertex = vertexIndex;
+    }
+  });
+
+  vertices.forEach((vertex) => {
+    if (vertex.anchor !== undefined && (vertex.anchor < 0 || vertex.anchor >= parsedAnchors.length)) {
+      delete vertex.anchor;
+    }
+  });
+
+  return { annotations, anchors: parsedAnchors, vertices };
+}
+
+function applyImportedMcvState(data: {
+  annotations: ManualAnnotation[];
+  anchors: StructureAnchor[];
+  vertices: StructureVertexData[];
+}): void {
+  MCV_DATA.annotations = data.annotations.map((line) => ({
+    from: { x: line.from.x, y: line.from.y },
+    to: { x: line.to.x, y: line.to.y },
+    axis: line.axis,
+    ...(line.length !== undefined ? { length: line.length } : {}),
+  }));
+  MCV_DATA.structure.anchors = data.anchors.map((anchor) => ({
+    from: normalizeLineRefs(anchor.from),
+    to: normalizeLineRefs(anchor.to),
+    vertex: anchor.vertex,
+    ...(anchor.x !== undefined ? { x: anchor.x } : {}),
+    ...(anchor.y !== undefined ? { y: anchor.y } : {}),
+    ...(anchor.z !== undefined ? { z: anchor.z } : {}),
+  }));
+  MCV_DATA.structure.vertices = data.vertices.map((vertex) => ({
+    from: normalizeLineRefs(vertex.from),
+    to: normalizeLineRefs(vertex.to),
+    ...(vertex.anchor !== undefined ? { anchor: vertex.anchor } : {}),
+    ...(vertex.x !== undefined ? { x: vertex.x } : {}),
+    ...(vertex.y !== undefined ? { y: vertex.y } : {}),
+    ...(vertex.z !== undefined ? { z: vertex.z } : {}),
+  }));
+  rebuildStructureFromAnnotations();
+  manualRedoLines.length = 0;
+  manualDraftLine = null;
+  manualDragPointerId = null;
+  manualDragClientX = 0;
+  manualDragClientY = 0;
+  manualAxisSelection = "x";
+  manualAxisStartsBackwards = false;
+  manualInteractionMode = "draw";
+  manualAnchorSelectedIndex = null;
+  manualAnchorSelectedInput = "";
+  manualAnchorHoveredVertex = null;
+  manualEditHoveredLineIndex = null;
+  manualEditSelectedLineIndex = null;
+  vertexSolveRenderData = null;
+  renderAnnotationPreviewHeld = false;
+}
+
+async function tryLoadMcvSvgFile(file: File): Promise<{ imageDataUrl: string; data: unknown } | null> {
+  const text = await readFileAsText(file);
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(text, "image/svg+xml");
+  if (!doc.querySelector("parsererror")) {
+    const scriptNode = doc.querySelector("script#mcv-data") ?? doc.querySelector("script[type='application/json']");
+    const imageNode =
+      doc.querySelector("image[data-role='mcv-base-image']") ??
+      doc.querySelector("image");
+    const href =
+      imageNode?.getAttribute("href") ||
+      imageNode?.getAttribute("xlink:href") ||
+      imageNode?.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+    if (scriptNode?.textContent && href) {
+      try {
+        const data = JSON.parse(scriptNode.textContent.trim());
+        return {
+          imageDataUrl: href,
+          data,
+        };
+      } catch {
+        // Fall through to robust text fallback.
+      }
+    }
+  }
+
+  const scriptMatch =
+    text.match(/<script[^>]*id=["']mcv-data["'][^>]*>([\s\S]*?)<\/script>/i) ||
+    text.match(/<script[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i);
+  const imageMatch =
+    text.match(/<image[^>]*data-role=["']mcv-base-image["'][^>]*\s(?:href|xlink:href)=["']([^"']+)["'][^>]*>/i) ||
+    text.match(/<image[^>]*\s(?:href|xlink:href)=["']([^"']+)["'][^>]*>/i);
+  if (!scriptMatch || !imageMatch) {
+    return null;
+  }
+  try {
+    const data = JSON.parse(scriptMatch[1].trim());
+    return {
+      imageDataUrl: imageMatch[1],
+      data,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function saveCurrentStateAsSvg(): Promise<void> {
+  if (!cropResultCache || !viewerMedia || viewerMedia.kind !== "image") {
+    return;
+  }
+  const width = cropResultCache.width;
+  const height = cropResultCache.height;
+  const imageDataUrl = await ensureEmbeddedImageDataUrl(cropResultCache.colorDataUrl);
+  const svgNs = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNs, "svg");
+  svg.setAttribute("xmlns", svgNs);
+  svg.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+  svg.setAttribute("xmlns:inkscape", "http://www.inkscape.org/namespaces/inkscape");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+
+  appendAxisMarkers(svg);
+
+  const baseLayer = createSvgLayer(svg, "base", true);
+  const baseImage = document.createElementNS(svgNs, "image");
+  baseImage.setAttribute("data-role", "mcv-base-image");
+  baseImage.setAttribute("href", imageDataUrl);
+  baseImage.setAttribute("x", "0");
+  baseImage.setAttribute("y", "0");
+  baseImage.setAttribute("width", String(width));
+  baseImage.setAttribute("height", String(height));
+  baseImage.setAttribute("preserveAspectRatio", "none");
+  baseLayer.appendChild(baseImage);
+
+  const annotationLayer = createSvgLayer(svg, "annotation", false);
+  renderLinesToLayer(annotationLayer, MCV_DATA.annotations, true, true);
+
+  const structureLayer = createSvgLayer(svg, "structure", true);
+  renderLinesToLayer(structureLayer, MCV_DATA.structure.lines, true, true);
+
+  const anchorsLayer = createSvgLayer(svg, "anchors", false);
+  MCV_DATA.structure.anchors.forEach((anchor, index) => {
+    const point = getAnchorPoint(anchor);
+    if (!point) {
+      return;
+    }
+    appendSvgPointDot(anchorsLayer, point, "#5dff74", 2.4);
+    appendSvgAnchorLabel(anchorsLayer, point, getAnchorLabel(anchor, index), "#5dff74");
+  });
+
+  const includeVerticesLayer =
+    getManualInteractionMode() === "vertexSolve" &&
+    vertexSolveRenderData !== null &&
+    vertexSolveRenderData.conflictVertexIndex === null;
+  if (includeVerticesLayer) {
+    const verticesLayer = createSvgLayer(svg, "vertices", false);
+    MCV_DATA.structure.vertices.forEach((vertex) => {
+      const point = getVertexDotPoint(vertex);
+      if (!point) {
+        return;
+      }
+      appendSvgPointDot(verticesLayer, point, "#5dff74", 2.2);
+    });
+  }
+
+  const script = document.createElementNS(svgNs, "script");
+  script.setAttribute("id", "mcv-data");
+  script.setAttribute("type", "application/json");
+  script.textContent = JSON.stringify(MCV_DATA);
+  svg.appendChild(script);
+
+  const serializer = new XMLSerializer();
+  const serialized = serializer.serializeToString(svg);
+  const blob = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
+  const objectUrl = URL.createObjectURL(blob);
+  const download = document.createElement("a");
+  download.href = objectUrl;
+  const safeTitle = viewerMedia.title.replace(/[^\w.-]+/g, "_");
+  download.download = `${safeTitle || "mcv"}_state.svg`;
+  document.body.appendChild(download);
+  download.click();
+  document.body.removeChild(download);
+  URL.revokeObjectURL(objectUrl);
+}
+
+async function handleUploadedFile(file: File): Promise<void> {
+  selectedUploadFilename = file.name;
+  pendingImportedMcvState = null;
+  if (isSvgFile(file)) {
+    try {
+      const parsed = await tryLoadMcvSvgFile(file);
+      if (parsed) {
+        const normalized = normalizeImportedMcvData(parsed.data);
+        if (normalized) {
+          pendingImportedMcvState = normalized;
+          openViewer({
+            tab: "upload",
+            id: "upload-file",
+            kind: "image",
+            title: file.name,
+            url: parsed.imageDataUrl,
+            isObjectUrl: false,
+          });
+          return;
+        }
+      }
+    } catch {
+      // Fall back to standard file loading below.
+    }
+  }
+  const objectUrl = URL.createObjectURL(file);
+  openViewer({
+    tab: "upload",
+    id: "upload-file",
+    kind: inferMediaKindFromFile(file),
+    title: file.name,
+    url: objectUrl,
+    isObjectUrl: true,
+  });
+}
+
 function clampVideoTime(video: HTMLVideoElement, seconds: number): number {
   if (!Number.isFinite(seconds) || seconds < 0) {
     return 0;
@@ -3933,16 +4405,7 @@ function createUploadZoneNode(): HTMLDivElement {
     const droppedFiles = event.dataTransfer?.files;
     if (droppedFiles && droppedFiles.length > 0) {
       const file = droppedFiles[0];
-      const objectUrl = URL.createObjectURL(file);
-      selectedUploadFilename = file.name;
-      openViewer({
-        tab: "upload",
-        id: "upload-file",
-        kind: inferMediaKindFromFile(file),
-        title: file.name,
-        url: objectUrl,
-        isObjectUrl: true,
-      });
+      void handleUploadedFile(file);
     }
   });
 
@@ -4009,6 +4472,11 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       target.isContentEditable);
 
   if (cropResultCache && viewerMedia?.kind === "image" && !targetIsEditable) {
+    if (event.ctrlKey && !event.shiftKey && (event.key === "s" || event.key === "S")) {
+      event.preventDefault();
+      void saveCurrentStateAsSvg();
+      return;
+    }
     if (event.key === "a" || event.key === "A") {
       event.preventDefault();
       setManualInteractionMode("anchor");
@@ -4436,16 +4904,7 @@ function installUiHandlers(): void {
     fileInput.addEventListener("change", () => {
       if (fileInput.files && fileInput.files.length > 0) {
         const file = fileInput.files[0];
-        const objectUrl = URL.createObjectURL(file);
-        selectedUploadFilename = file.name;
-        openViewer({
-          tab: "upload",
-          id: "upload-file",
-          kind: inferMediaKindFromFile(file),
-          title: file.name,
-          url: objectUrl,
-          isObjectUrl: true,
-        });
+        void handleUploadedFile(file);
         fileInput.value = "";
       }
     });
