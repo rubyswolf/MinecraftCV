@@ -36,16 +36,35 @@ type McvImagePipelineArgs = {
 
 type McvLineSegment = [number, number, number, number];
 type ManualAxis = "x" | "y" | "z";
-type DirectedManualLine = {
-  segment: McvLineSegment;
+type ManualPoint = {
+  x: number;
+  y: number;
+};
+type ManualAnnotation = {
+  from: ManualPoint;
+  to: ManualPoint;
   axis: ManualAxis;
-  edgeLength: number;
+  length?: number;
+};
+type StructureEndpoint = ManualPoint & {
+  from: number[];
+  to: number[];
+};
+type StructureLine = {
+  from: StructureEndpoint;
+  to: StructureEndpoint;
+  axis: ManualAxis;
+  length?: number;
+};
+type StructureData = {
+  lines: StructureLine[];
 };
 type DraftManualLine = {
-  segment: McvLineSegment;
+  from: ManualPoint;
+  to: ManualPoint;
   axis: ManualAxis;
   flipped: boolean;
-  edgeLength: number;
+  length?: number;
 };
 
 type McvImagePipelineResult = {
@@ -137,6 +156,10 @@ type LaunchSelectionIntent = {
 declare global {
   interface Window {
     MCV_API?: McvClientApi;
+    MCV_DATA?: {
+      annotations: ManualAnnotation[];
+      structure: StructureData;
+    };
   }
 }
 
@@ -166,8 +189,13 @@ let cropResultCache:
   | null = null;
 let manualAxisSelection: ManualAxis = "x";
 let manualAxisStartsBackwards = false;
-let manualLines: DirectedManualLine[] = [];
-let manualRedoLines: DirectedManualLine[] = [];
+const MCV_DATA: { annotations: ManualAnnotation[]; structure: StructureData } = {
+  annotations: [],
+  structure: {
+    lines: [],
+  },
+};
+let manualRedoLines: ManualAnnotation[] = [];
 let manualDraftLine: DraftManualLine | null = null;
 let manualDragPointerId: number | null = null;
 let manualDragClientX = 0;
@@ -209,9 +237,129 @@ const movement = {
 }; //buttery
 // const movement = {speed: 1.0,friction: 0.05,grip: 0.2,stop: 0.0,slip: 1.0,buildup: 0.5,zoomSpeed: 0.001} //gliding
 
+function getAnnotationLength(annotation: ManualAnnotation): number {
+  return Math.hypot(annotation.to.x - annotation.from.x, annotation.to.y - annotation.from.y);
+}
+
+function computeStructureLinkThreshold(annotations: ManualAnnotation[]): number {
+  if (annotations.length === 0) {
+    return 3;
+  }
+  const lengths = annotations
+    .map((annotation) => getAnnotationLength(annotation))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  if (lengths.length === 0) {
+    return 3;
+  }
+  const median = lengths[Math.floor(lengths.length / 2)];
+  return Math.max(2, Math.min(10, median * 0.08));
+}
+
+function linkStructureEndpoints(
+  firstLine: StructureLine,
+  firstEndpoint: "from" | "to",
+  secondLine: StructureLine,
+  secondEndpoint: "from" | "to",
+  firstIndex: number,
+  secondIndex: number
+): void {
+  const firstLinks = firstLine[firstEndpoint][secondEndpoint];
+  if (!firstLinks.includes(secondIndex)) {
+    firstLinks.push(secondIndex);
+  }
+  const secondLinks = secondLine[secondEndpoint][firstEndpoint];
+  if (!secondLinks.includes(firstIndex)) {
+    secondLinks.push(firstIndex);
+  }
+}
+
+function createStructureLineFromAnnotation(annotation: ManualAnnotation): StructureLine {
+  return {
+    from: {
+      x: annotation.from.x,
+      y: annotation.from.y,
+      from: [],
+      to: [],
+    },
+    to: {
+      x: annotation.to.x,
+      y: annotation.to.y,
+      from: [],
+      to: [],
+    },
+    axis: annotation.axis,
+    ...(annotation.length !== undefined && annotation.length > 0 ? { length: annotation.length } : {}),
+  };
+}
+
+function linkLineIndexAgainstOthers(lineIndex: number): void {
+  const lines = MCV_DATA.structure.lines;
+  if (lineIndex < 0 || lineIndex >= lines.length) {
+    return;
+  }
+  const line = lines[lineIndex];
+  line.from.from.length = 0;
+  line.from.to.length = 0;
+  line.to.from.length = 0;
+  line.to.to.length = 0;
+
+  const threshold = computeStructureLinkThreshold(MCV_DATA.annotations);
+  for (let otherIndex = 0; otherIndex < lines.length; otherIndex += 1) {
+    if (otherIndex === lineIndex) {
+      continue;
+    }
+    const other = lines[otherIndex];
+    if (other.axis === line.axis) {
+      continue;
+    }
+    (["from", "to"] as const).forEach((lineEndpoint) => {
+      (["from", "to"] as const).forEach((otherEndpoint) => {
+        const firstPoint = line[lineEndpoint];
+        const secondPoint = other[otherEndpoint];
+        const distance = Math.hypot(firstPoint.x - secondPoint.x, firstPoint.y - secondPoint.y);
+        if (distance <= threshold) {
+          linkStructureEndpoints(line, lineEndpoint, other, otherEndpoint, lineIndex, otherIndex);
+        }
+      });
+    });
+  }
+}
+
+function pushAnnotationWithStructureLink(annotation: ManualAnnotation): void {
+  MCV_DATA.annotations.push(annotation);
+  MCV_DATA.structure.lines.push(createStructureLineFromAnnotation(annotation));
+  linkLineIndexAgainstOthers(MCV_DATA.structure.lines.length - 1);
+}
+
+function popAnnotationWithStructureUnlink(): ManualAnnotation | undefined {
+  if (MCV_DATA.annotations.length === 0 || MCV_DATA.structure.lines.length === 0) {
+    return undefined;
+  }
+  const removedIndex = MCV_DATA.structure.lines.length - 1;
+  const removed = MCV_DATA.annotations.pop();
+  MCV_DATA.structure.lines.pop();
+  MCV_DATA.structure.lines.forEach((line) => {
+    line.from.from = line.from.from.filter((value) => value !== removedIndex);
+    line.from.to = line.from.to.filter((value) => value !== removedIndex);
+    line.to.from = line.to.from.filter((value) => value !== removedIndex);
+    line.to.to = line.to.to.filter((value) => value !== removedIndex);
+  });
+  return removed;
+}
+
+function rebuildStructureFromAnnotations(): void {
+  const annotations = MCV_DATA.annotations;
+  MCV_DATA.structure.lines = annotations.map((line) => createStructureLineFromAnnotation(line));
+  for (let i = 0; i < MCV_DATA.structure.lines.length; i += 1) {
+    linkLineIndexAgainstOthers(i);
+  }
+}
+
 function resetCropInteractionState(): void {
-  manualLines = [];
-  manualRedoLines = [];
+  MCV_DATA.annotations.length = 0;
+  MCV_DATA.structure.lines.length = 0;
+  manualRedoLines.length = 0;
   manualDraftLine = null;
   manualDragPointerId = null;
   manualDragClientX = 0;
@@ -562,6 +710,8 @@ function installGlobalApi(): void {
       backend: __MCV_BACKEND__,
     },
   };
+  rebuildStructureFromAnnotations();
+  window.MCV_DATA = MCV_DATA;
 }
 
 function getMediaBoxNode(): HTMLDivElement | null {
@@ -819,10 +969,10 @@ function appendSvgLine(
 function appendSvgLineLabel(
   parent: SVGElement,
   segment: McvLineSegment,
-  textValue: number,
+  textValue: number | undefined,
   color: string
 ): void {
-  if (textValue <= 0) {
+  if (textValue === undefined || textValue <= 0) {
     return;
   }
   const svgNs = "http://www.w3.org/2000/svg";
@@ -847,11 +997,31 @@ function adjustDraftEdgeLength(delta: number): void {
   if (!manualDraftLine) {
     return;
   }
-  manualDraftLine = {
-    ...manualDraftLine,
-    edgeLength: Math.max(0, manualDraftLine.edgeLength + delta),
-  };
+  const current = manualDraftLine.length ?? 0;
+  const next = Math.max(0, current + delta);
+  manualDraftLine =
+    next > 0
+      ? {
+          ...manualDraftLine,
+          length: next,
+        }
+      : {
+          from: manualDraftLine.from,
+          to: manualDraftLine.to,
+          axis: manualDraftLine.axis,
+          flipped: manualDraftLine.flipped,
+        };
   renderCropResultFromCache();
+}
+
+function getLineSegmentForAnnotation(annotation: ManualAnnotation): McvLineSegment {
+  return [annotation.from.x, annotation.from.y, annotation.to.x, annotation.to.y];
+}
+
+function getLineSegmentForDraft(draft: DraftManualLine): McvLineSegment {
+  const from = draft.flipped ? draft.to : draft.from;
+  const to = draft.flipped ? draft.from : draft.to;
+  return [from.x, from.y, to.x, to.y];
 }
 
 function getAxisColor(axis: ManualAxis): string {
@@ -940,27 +1110,21 @@ function createManualModeCropResultSvg(
     return svg;
   }
 
-  for (const line of manualLines) {
+  for (const line of MCV_DATA.annotations) {
     const axisColor = getAxisColor(line.axis);
+    const segment = getLineSegmentForAnnotation(line);
     appendSvgLine(
       sceneGroup,
-      line.segment,
+      segment,
       axisColor,
       2,
       1,
       getAxisMarkerId(line.axis)
     );
-    appendSvgLineLabel(sceneGroup, line.segment, line.edgeLength, axisColor);
+    appendSvgLineLabel(sceneGroup, segment, line.length, axisColor);
   }
   if (manualDraftLine) {
-    const draftSegment = manualDraftLine.flipped
-      ? ([
-          manualDraftLine.segment[2],
-          manualDraftLine.segment[3],
-          manualDraftLine.segment[0],
-          manualDraftLine.segment[1],
-        ] as McvLineSegment)
-      : manualDraftLine.segment;
+    const draftSegment = getLineSegmentForDraft(manualDraftLine);
     const axisColor = getAxisColor(manualDraftLine.axis);
     appendSvgLine(
       sceneGroup,
@@ -970,7 +1134,7 @@ function createManualModeCropResultSvg(
       0.95,
       getAxisMarkerId(manualDraftLine.axis)
     );
-    appendSvgLineLabel(sceneGroup, draftSegment, manualDraftLine.edgeLength, axisColor);
+    appendSvgLineLabel(sceneGroup, draftSegment, manualDraftLine.length, axisColor);
   }
 
   svg.addEventListener("pointerdown", (event) => {
@@ -990,10 +1154,10 @@ function createManualModeCropResultSvg(
       return;
     }
     manualDraftLine = {
-      segment: [point.x, point.y, point.x, point.y],
+      from: { x: point.x, y: point.y },
+      to: { x: point.x, y: point.y },
       axis: manualAxisSelection,
       flipped: manualAxisStartsBackwards,
-      edgeLength: 0,
     };
     manualDragPointerId = event.pointerId;
     manualDragClientX = event.clientX;
@@ -1125,12 +1289,10 @@ function updateManualDraftFromPointer(pointer: PointerEvent): void {
   }
   manualDraftLine = {
     ...manualDraftLine,
-    segment: [
-      manualDraftLine.segment[0],
-      manualDraftLine.segment[1],
-      point.x,
-      point.y,
-    ],
+    to: {
+      x: point.x,
+      y: point.y,
+    },
   };
   renderCropResultFromCache();
 }
@@ -1166,27 +1328,30 @@ function finalizeManualDraftFromPointer(pointer: PointerEvent): void {
     cropResultCache.width,
     cropResultCache.height
   );
-  const draftSegment: McvLineSegment = point
-    ? [manualDraftLine.segment[0], manualDraftLine.segment[1], point.x, point.y]
-    : manualDraftLine.segment;
-  const committedSegment: McvLineSegment = manualDraftLine.flipped
-    ? [draftSegment[2], draftSegment[3], draftSegment[0], draftSegment[1]]
-    : draftSegment;
-  const committedAxis = manualDraftLine.axis;
-  const committedEdgeLength = manualDraftLine.edgeLength;
+  const updatedDraft: DraftManualLine = point
+    ? {
+        ...manualDraftLine,
+        to: { x: point.x, y: point.y },
+      }
+    : manualDraftLine;
+  const committedFrom = updatedDraft.flipped ? updatedDraft.to : updatedDraft.from;
+  const committedTo = updatedDraft.flipped ? updatedDraft.from : updatedDraft.to;
+  const committedAxis = updatedDraft.axis;
+  const committedLength = updatedDraft.length;
   manualDraftLine = null;
 
   const length = Math.hypot(
-    committedSegment[2] - committedSegment[0],
-    committedSegment[3] - committedSegment[1]
+    committedTo.x - committedFrom.x,
+    committedTo.y - committedFrom.y
   );
   if (length >= 2) {
-    manualLines.push({
-      segment: committedSegment,
+    pushAnnotationWithStructureLink({
+      from: committedFrom,
+      to: committedTo,
       axis: committedAxis,
-      edgeLength: committedEdgeLength,
+      ...(committedLength !== undefined && committedLength > 0 ? { length: committedLength } : {}),
     });
-    manualRedoLines = [];
+    manualRedoLines.length = 0;
   }
   renderCropResultFromCache();
 }
@@ -2312,8 +2477,8 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       if (manualDraftLine) {
         manualDraftLine = null;
         manualDragPointerId = null;
-      } else if (manualLines.length > 0) {
-        const removed = manualLines.pop();
+      } else if (MCV_DATA.annotations.length > 0) {
+        const removed = popAnnotationWithStructureUnlink();
         if (removed) {
           manualRedoLines.push(removed);
         }
@@ -2325,9 +2490,9 @@ function handleViewerKeybind(event: KeyboardEvent): void {
       event.preventDefault();
       const restored = manualRedoLines.pop();
       if (restored) {
-        manualLines.push(restored);
-        renderCropResultFromCache();
+        pushAnnotationWithStructureLink(restored);
       }
+      renderCropResultFromCache();
       return;
     }
 
@@ -2562,6 +2727,12 @@ function installUiHandlers(): void {
   });
   document.addEventListener("pointercancel", (event) => {
     finalizeManualDraftFromPointer(event);
+  });
+  window.addEventListener("resize", () => {
+    if (!cropResultCache) {
+      return;
+    }
+    renderCropResultFromCache();
   });
   if (searchInput) {
     searchInput.addEventListener("input", () => {
